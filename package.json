@@ -1,0 +1,30 @@
+{
+  "name": "anbo",
+  "version": "0.1.0",
+  "description": "Anbo CLI for isolated Postgres preview branches.",
+  "type": "module",
+  "homepage": "https://getanbo.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getanbo/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/getanbo/cli/issues"
+  },
+  "bin": {
+    "anbo": "dist/scripts/anbo-cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "anbo",
+    "postgres",
+    "database-branches",
+    "cli"
+  ],
+  "license": "UNLICENSED"
+}
