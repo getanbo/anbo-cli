@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -98,7 +98,7 @@ export async function runAnboCli(args, dependencies = {}) {
         }
     }
     catch (error) {
-        writeErr(runtimeDependencies, getErrorMessage(error));
+        writeErr(runtimeDependencies, redactSensitiveText(getErrorMessage(error)));
         return 1;
     }
 }
@@ -215,7 +215,7 @@ async function runSetup(parsed, dependencies) {
         return;
     }
     const input = {
-        apiUrl: await requiredSetupValue(parsed, dependencies, "api-url", "Env API URL"),
+        apiUrl: apiBaseUrlFromUrl(await requiredSetupValue(parsed, dependencies, "api-url", "Env API URL"), "Env API URL"),
         project: await requiredSetupValue(parsed, dependencies, "project", "Project name", detected.name),
         source: await requiredSetupValue(parsed, dependencies, "source", "Source Postgres alias"),
         routeBaseUrl: await requiredSetupValue(parsed, dependencies, "route-base-url", "Preview route base URL"),
@@ -341,6 +341,9 @@ function httpOriginFromUrl(value, label) {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         throw new Error(`${label} must use http or https`);
     }
+    if (parsed.protocol === "http:" && !isLocalHttpHost(parsed.hostname)) {
+        throw new Error(`${label} must use https unless it targets localhost`);
+    }
     return parsed.origin;
 }
 function optionalHttpOriginFromUrl(value) {
@@ -353,6 +356,37 @@ function optionalHttpOriginFromUrl(value) {
     catch {
         return undefined;
     }
+}
+function apiBaseUrlFromUrl(value, label) {
+    let parsed;
+    try {
+        parsed = new URL(value);
+    }
+    catch {
+        throw new Error(`${label} must be a valid URL`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error(`${label} must use http or https`);
+    }
+    if (parsed.protocol === "http:" && !isLocalHttpHost(parsed.hostname)) {
+        throw new Error(`${label} must use https unless it targets localhost`);
+    }
+    if (parsed.username.length > 0 || parsed.password.length > 0) {
+        throw new Error(`${label} must not include embedded credentials`);
+    }
+    if (parsed.search.length > 0 || parsed.hash.length > 0) {
+        throw new Error(`${label} must not include query strings or fragments`);
+    }
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/$/, "");
+}
+function isLocalHttpHost(hostname) {
+    const normalized = hostname.toLowerCase();
+    return normalized === "localhost" ||
+        normalized === "127.0.0.1" ||
+        normalized === "::1" ||
+        normalized === "[::1]" ||
+        normalized.endsWith(".localhost");
 }
 function openUrlInBrowser(url, dependencies) {
     if (dependencies.openBrowser !== undefined) {
@@ -403,19 +437,21 @@ async function runBranch(parsed, dependencies) {
     const token = previewTokenFromArgs(parsed, dependencies, previewUrl);
     if (subcommand === "create") {
         const name = requiredPositional(parsed, 1, "branch name");
+        const json = boolFlag(parsed, "json");
+        if (!json) {
+            writeOut(dependencies, `creating branch ${name}...`);
+        }
         let branch = await previewApiRequest(dependencies, previewUrl, "POST", "/v1/branches", { name }, token);
         if (!boolFlag(parsed, "no-wait")) {
-            branch = await waitForDemoBranchReady(dependencies, previewUrl, token, name, branch, boolFlag(parsed, "json"));
-            const url = await requestDemoBranchUrl(dependencies, previewUrl, token, name);
-            branch = { ...branch, database_url: url.database_url };
+            branch = await waitForDemoBranchReady(dependencies, previewUrl, token, name, branch, json);
         }
-        printDemoBranch(dependencies, branch, boolFlag(parsed, "json"));
+        printDemoBranch(dependencies, branch, json, boolFlag(parsed, "show-secrets"));
         return;
     }
     if (subcommand === "info") {
         const name = requiredPositional(parsed, 1, "branch name or id");
         const branch = await previewApiRequest(dependencies, previewUrl, "GET", `/v1/branches/${encodeURIComponent(name)}`, undefined, token);
-        printDemoBranch(dependencies, branch, boolFlag(parsed, "json"));
+        printDemoBranch(dependencies, branch, boolFlag(parsed, "json"), boolFlag(parsed, "show-secrets"));
         return;
     }
     if (subcommand === "url") {
@@ -431,19 +467,20 @@ async function runBranch(parsed, dependencies) {
     }
     if (subcommand === "list") {
         const result = await previewApiRequest(dependencies, previewUrl, "GET", "/v1/branches", undefined, token);
-        printDemoBranchList(dependencies, result, boolFlag(parsed, "json"));
+        printDemoBranchList(dependencies, result, boolFlag(parsed, "json"), boolFlag(parsed, "show-secrets"));
         return;
     }
     if (subcommand === "delete") {
         const name = requiredPositional(parsed, 1, "branch name or id");
         const branch = await previewApiRequest(dependencies, previewUrl, "DELETE", `/v1/branches/${encodeURIComponent(name)}`, undefined, token);
-        printDemoBranch(dependencies, branch, boolFlag(parsed, "json"));
+        printDemoBranch(dependencies, branch, boolFlag(parsed, "json"), boolFlag(parsed, "show-secrets"));
         return;
     }
     throw new Error(`unknown branch command ${subcommand}`);
 }
 async function waitForDemoBranchReady(dependencies, previewUrl, token, name, initial, quiet) {
     let latest = initial;
+    const pollId = initial.id;
     const deadline = Date.now() + 180_000;
     let lastStatus = "";
     while (Date.now() < deadline) {
@@ -459,7 +496,7 @@ async function waitForDemoBranchReady(dependencies, previewUrl, token, name, ini
             lastStatus = statusLine;
         }
         await sleepFor(dependencies, 2_000);
-        latest = await previewApiRequest(dependencies, previewUrl, "GET", `/v1/branches/${encodeURIComponent(name)}`, undefined, token);
+        latest = await previewApiRequest(dependencies, previewUrl, "GET", `/v1/branches/${encodeURIComponent(pollId)}`, undefined, token);
     }
     throw new Error(`timed out waiting for branch ${name}; latest status was ${latest.status}`);
 }
@@ -575,7 +612,7 @@ async function runPreviewCreate(parsed, dependencies, config) {
         session = await waitForPreviewSession(dependencies, previewUrl, token, session.id);
     }
     writeActivePreviewSession(dependencies, previewUrl, session.id);
-    printPreviewSession(dependencies, session, boolFlag(parsed, "json"));
+    printPreviewSession(dependencies, session, boolFlag(parsed, "json"), boolFlag(parsed, "show-secrets"));
     if (!boolFlag(parsed, "no-wait") && session.status === "failed") {
         throw new Error(`preview environment ${session.env_id} failed: ${session.message ?? "unknown error"}`);
     }
@@ -585,7 +622,7 @@ async function runPreviewStatus(parsed, dependencies, config) {
     const token = previewTokenFromArgs(parsed, dependencies, previewUrl);
     const sessionId = previewSessionIdFromArgs(parsed, dependencies, previewUrl, 0);
     const session = await previewApiRequest(dependencies, previewUrl, "GET", `/v1/demo/sessions/${encodeURIComponent(sessionId)}`, undefined, token);
-    printPreviewSession(dependencies, session, boolFlag(parsed, "json"));
+    printPreviewSession(dependencies, session, boolFlag(parsed, "json"), boolFlag(parsed, "show-secrets"));
 }
 async function runPreviewDestroy(parsed, dependencies, config) {
     const previewUrl = previewApiUrlFromConfig(parsed, dependencies, config);
@@ -596,7 +633,7 @@ async function runPreviewDestroy(parsed, dependencies, config) {
         session = await waitForPreviewSession(dependencies, previewUrl, token, sessionId, (candidate) => candidate.status === "deleted");
     }
     clearActivePreviewSession(dependencies, previewUrl, sessionId);
-    printPreviewSession(dependencies, session, boolFlag(parsed, "json"));
+    printPreviewSession(dependencies, session, boolFlag(parsed, "json"), boolFlag(parsed, "show-secrets"));
 }
 async function runTest(parsed, dependencies) {
     const config = readRepoConfig(dependencies);
@@ -664,7 +701,7 @@ async function runReport(parsed, dependencies) {
 function writeJsonReport(dependencies, report, out) {
     const json = `${JSON.stringify(report, null, 2)}\n`;
     if (out === undefined) {
-        writeOut(dependencies, json.trimEnd());
+        writeOut(dependencies, JSON.stringify(redactJsonSecrets(report), null, 2));
         return;
     }
     const outPath = resolve(dependencies.cwd ?? process.cwd(), out);
@@ -813,7 +850,7 @@ function isPreviewConfig(config) {
     return config.mode === "demo" || config.mode === "preview";
 }
 function previewApiUrlFromConfig(parsed, dependencies, config) {
-    return (stringFlag(parsed, "api-url")
+    return apiBaseUrlFromUrl(stringFlag(parsed, "api-url")
         ?? stringFlag(parsed, "preview-api-url")
         ?? stringFlag(parsed, "app-url")
         ?? stringFlag(parsed, "demo-url")
@@ -821,10 +858,10 @@ function previewApiUrlFromConfig(parsed, dependencies, config) {
         ?? dependencies.env?.ANBO_APP_URL
         ?? dependencies.env?.ANBO_DEMO_API_URL
         ?? config.apiUrl
-        ?? DEFAULT_PREVIEW_API_URL).replace(/\/+$/, "");
+        ?? DEFAULT_PREVIEW_API_URL, "Preview API URL");
 }
 function previewApiUrlFromArgs(parsed, dependencies) {
-    return (stringFlag(parsed, "api-url")
+    return apiBaseUrlFromUrl(stringFlag(parsed, "api-url")
         ?? stringFlag(parsed, "preview-api-url")
         ?? stringFlag(parsed, "app-url")
         ?? stringFlag(parsed, "demo-url")
@@ -832,7 +869,7 @@ function previewApiUrlFromArgs(parsed, dependencies) {
         ?? dependencies.env?.ANBO_APP_URL
         ?? dependencies.env?.ANBO_DEMO_API_URL
         ?? dependencies.env?.ANBO_K8_DEMO_API_URL
-        ?? DEFAULT_PREVIEW_API_URL).replace(/\/+$/, "");
+        ?? DEFAULT_PREVIEW_API_URL, "Preview API URL");
 }
 function previewTokenFromArgs(parsed, dependencies, previewUrl) {
     const token = stringFlag(parsed, "token")
@@ -916,14 +953,13 @@ async function previewApiRequestOrError(dependencies, previewUrl, method, path, 
     return { ok: true, body: parsed };
 }
 function envApiClient(config, parsed, dependencies) {
-    const apiUrl = stringFlag(parsed, "api-url")
+    const apiUrl = apiBaseUrlFromUrl(stringFlag(parsed, "api-url")
         ?? dependencies.env?.ANBO_ENV_API_URL
         ?? dependencies.env?.ANBO_K8S_ENV_API_URL
-        ?? config.apiUrl;
+        ?? config.apiUrl, "Env API URL");
     const token = stringFlag(parsed, "token")
         ?? dependencies.env?.ANBO_ENV_API_TOKEN
         ?? dependencies.env?.ANBO_K8S_ENV_API_TOKEN
-        ?? dependencies.env?.ANBO_K8S_CONTROL_TOKEN
         ?? readCredential(dependencies, apiUrl);
     if (token === undefined || token.length === 0) {
         throw new Error("Env API token is required; set ANBO_ENV_API_TOKEN or run anbo setup --token <token>");
@@ -931,7 +967,7 @@ function envApiClient(config, parsed, dependencies) {
     const fetchImpl = dependencies.fetch ?? globalThis.fetch;
     return {
         async request(method, path, body) {
-            const response = await fetchImpl(`${apiUrl.replace(/\/+$/, "")}${path}`, {
+            const response = await fetchImpl(`${apiUrl}${path}`, {
                 method,
                 headers: {
                     "content-type": "application/json",
@@ -993,8 +1029,14 @@ function readCredentials(dependencies) {
 }
 function writeCredentials(dependencies, credentials) {
     const path = credentialsPath(dependencies);
-    mkdirSync(dirname(path), { recursive: true });
+    const dir = dirname(path);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+    if (existsSync(path) && lstatSync(path).isSymbolicLink()) {
+        throw new Error(`refusing to write Anbo credentials through a symlink: ${path}`);
+    }
     writeFileSync(path, `${JSON.stringify(credentials, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(path, 0o600);
 }
 function writeRepoConfig(cwd, config) {
     const path = resolve(cwd, CONFIG_PATH);
@@ -1067,7 +1109,10 @@ function credentialsPath(dependencies) {
             return join(windowsConfigRoot, "anbo", "credentials.json");
         }
     }
-    const homeDir = dependencies.homeDir ?? env.HOME ?? ".";
+    const homeDir = dependencies.homeDir ?? env.HOME;
+    if (homeDir === undefined || homeDir.trim().length === 0) {
+        throw new Error("Cannot determine Anbo credentials directory; set HOME or pass a platform config directory");
+    }
     return join(homeDir, ".config", "anbo", "credentials.json");
 }
 function assertRepoConfig(value) {
@@ -1280,7 +1325,7 @@ function printEnvironmentSummary(dependencies, summary, json) {
 }
 function printTestRunSummary(dependencies, summary, json) {
     if (json) {
-        writeOut(dependencies, JSON.stringify(summary, null, 2));
+        writeOut(dependencies, JSON.stringify(redactJsonSecrets(summary), null, 2));
         return;
     }
     writeOut(dependencies, `env_id: ${summary.envId}`);
@@ -1312,13 +1357,13 @@ function printTestRunSummary(dependencies, summary, json) {
     if (summary.logTail !== undefined && summary.logTail.length > 0) {
         writeOut(dependencies, "log_tail:");
         for (const line of summary.logTail.slice(-20)) {
-            writeOut(dependencies, `  ${line}`);
+            writeOut(dependencies, `  ${redactSensitiveText(line)}`);
         }
     }
 }
 function printTestRunLogs(dependencies, logs, json) {
     if (json) {
-        writeOut(dependencies, JSON.stringify(logs, null, 2));
+        writeOut(dependencies, JSON.stringify(redactJsonSecrets(logs), null, 2));
         return;
     }
     writeOut(dependencies, `env_id: ${logs.envId}`);
@@ -1329,13 +1374,13 @@ function printTestRunLogs(dependencies, logs, json) {
         const container = entry.container === undefined ? "" : ` container=${entry.container}`;
         writeOut(dependencies, `--- job=${entry.jobName}${pod}${container}`);
         for (const line of entry.text.split(/\r?\n/)) {
-            writeOut(dependencies, line);
+            writeOut(dependencies, redactSensitiveText(line));
         }
     }
 }
-function printPreviewSession(dependencies, session, json) {
+function printPreviewSession(dependencies, session, json, showSecrets = false) {
     if (json) {
-        writeOut(dependencies, JSON.stringify(session, null, 2));
+        writeOut(dependencies, JSON.stringify(showSecrets ? session : redactJsonSecrets(session), null, 2));
         return;
     }
     writeOut(dependencies, `session_id: ${session.id}`);
@@ -1347,15 +1392,15 @@ function printPreviewSession(dependencies, session, json) {
         writeOut(dependencies, `preview_url: ${session.preview_url}`);
     }
     if (session.database_url !== null) {
-        writeOut(dependencies, `database_url: ${session.database_url}`);
+        writeOut(dependencies, showSecrets ? `database_url: ${session.database_url}` : "database_url: [redacted; use anbo branch url NAME]");
     }
     if (session.message !== null) {
         writeOut(dependencies, `message: ${session.message}`);
     }
 }
-function printDemoBranch(dependencies, branch, json) {
+function printDemoBranch(dependencies, branch, json, showSecrets = false) {
     if (json) {
-        writeOut(dependencies, JSON.stringify(branch, null, 2));
+        writeOut(dependencies, JSON.stringify(showSecrets ? branch : redactJsonSecrets(branch), null, 2));
         return;
     }
     writeOut(dependencies, `branch_id: ${branch.id}`);
@@ -1363,12 +1408,12 @@ function printDemoBranch(dependencies, branch, json) {
     writeOut(dependencies, `status: ${branch.status}`);
     writeOut(dependencies, `ready: ${branch.ready ? "true" : "false"}`);
     if (branch.database_url !== null) {
-        writeOut(dependencies, `database_url: ${branch.database_url}`);
+        writeOut(dependencies, showSecrets ? `database_url: ${branch.database_url}` : "database_url: [redacted; use anbo branch url NAME]");
     }
 }
-function printDemoBranchList(dependencies, result, json) {
+function printDemoBranchList(dependencies, result, json, showSecrets = false) {
     if (json) {
-        writeOut(dependencies, JSON.stringify(result, null, 2));
+        writeOut(dependencies, JSON.stringify(showSecrets ? result : redactJsonSecrets(result), null, 2));
         return;
     }
     if (result.branches.length === 0) {
@@ -1376,7 +1421,7 @@ function printDemoBranchList(dependencies, result, json) {
         return;
     }
     for (const branch of result.branches) {
-        const url = branch.database_url === null ? "" : ` database_url=${branch.database_url}`;
+        const url = branch.database_url === null ? "" : showSecrets ? ` database_url=${branch.database_url}` : " database_url=[redacted]";
         writeOut(dependencies, `${branch.name} branch_id=${branch.id} status=${branch.status}${url}`);
     }
 }
@@ -1586,6 +1631,35 @@ function hashText(value) {
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function redactJsonSecrets(value) {
+    if (typeof value === "string") {
+        return redactSensitiveText(value);
+    }
+    if (Array.isArray(value)) {
+        return value.map((item) => redactJsonSecrets(item));
+    }
+    if (isRecord(value)) {
+        const redacted = {};
+        for (const [key, entry] of Object.entries(value)) {
+            const normalizedKey = key.toLowerCase();
+            if (normalizedKey === "database_url" || normalizedKey.includes("authorization") || normalizedKey.endsWith("token") || normalizedKey.includes("password") || normalizedKey.includes("secret")) {
+                redacted[key] = entry === null || entry === undefined ? entry : "[redacted]";
+            }
+            else {
+                redacted[key] = redactJsonSecrets(entry);
+            }
+        }
+        return redacted;
+    }
+    return value;
+}
+function redactSensitiveText(value) {
+    return value
+        .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+\b/gi, "Bearer [redacted]")
+        .replace(/\banbo_[A-Za-z0-9._-]+\b/g, "anbo_[redacted]")
+        .replace(/\bpostgres(?:ql)?:\/\/[^\s"'<>]+/gi, "postgres://[redacted]")
+        .replace(/(database_url=)[^\s]+/gi, "$1[redacted]");
+}
 function writeOut(dependencies, line) {
     (dependencies.stdout ?? console.log)(line);
 }
@@ -1617,7 +1691,7 @@ if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === realpath
     runAnboCli(process.argv.slice(2)).then((code) => {
         process.exitCode = code;
     }).catch((error) => {
-        console.error(getErrorMessage(error));
+        console.error(redactSensitiveText(getErrorMessage(error)));
         process.exitCode = 1;
     });
 }
