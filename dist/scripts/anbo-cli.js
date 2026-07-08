@@ -445,7 +445,7 @@ async function runBranch(parsed, dependencies) {
         if (!boolFlag(parsed, "no-wait")) {
             branch = await waitForDemoBranchReady(dependencies, previewUrl, token, name, branch, json);
         }
-        printDemoBranch(dependencies, branch, json, boolFlag(parsed, "show-secrets"));
+        printDemoBranch(dependencies, branch, json, true);
         return;
     }
     if (subcommand === "info") {
