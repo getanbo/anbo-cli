@@ -1,0 +1,27 @@
+name: Bug report
+description: Report reproducible MiniStack target behavior.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, clone URLs, Terraform state, or unredacted events.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Anbo CLI, plugin, runtime image digest, Node.js, and Docker versions.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Installed-CLI reproduction
+      description: Include the exact anbo command and smallest trusted project that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted JSONL diagnostics
+      description: Include stable diagnostic codes and the relevant redacted events.
