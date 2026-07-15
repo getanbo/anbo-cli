@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "plugin_api": 1,
+  "id": "anbo.ministack",
+  "name": "Anbo MiniStack acceptance fixture",
+  "package": "@getanbo/plugin-ministack",
+  "version": "0.1.0",
+  "entrypoint": "./index.mjs",
+  "engines": { "anbo": ">=0.2.0 <0.3.0", "node": ">=20.0.0" },
+  "kinds": ["target"],
+  "targets": ["ministack"],
+  "actions": ["configure", "deploy", "status", "test", "logs", "debug", "down", "capabilities", "cache"],
+  "config": { "schema": "./config.schema.json", "schema_version": 1 },
+  "capabilities": ["acceptance.fixture"]
+}

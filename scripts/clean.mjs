@@ -1,6 +1,6 @@
-import { rm } from "node:fs/promises";
-import { glob } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 
-for await (const path of glob("packages/*/{dist,*.tsbuildinfo}")) {
-  await rm(path, { recursive: true, force: true });
+for (const entry of await readdir("packages", { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  await rm(`packages/${entry.name}/dist`, { recursive: true, force: true });
 }

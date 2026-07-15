@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/event.v1.schema.json",
+  "title": "Anbo Run Event v1",
+  "type": "object",
+  "required": ["apiVersion", "runId", "sequence", "timestamp", "source", "command", "type", "level"],
+  "properties": {
+    "apiVersion": { "const": "anbo.dev/event/v1" },
+    "runId": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "source": { "type": "string", "minLength": 1 },
+    "command": { "type": "string", "minLength": 1 },
+    "target": { "type": "string", "minLength": 1 },
+    "type": { "type": "string", "minLength": 1 },
+    "level": { "enum": ["debug", "info", "warn", "error"] },
+    "message": { "type": "string" },
+    "data": { "type": "object" }
+  },
+  "additionalProperties": false
+}

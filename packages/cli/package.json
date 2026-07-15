@@ -33,6 +33,10 @@
     "@getanbo/plugin-sdk": "0.2.0",
     "ajv": "^8.17.1"
   },
+  "optionalDependencies": {
+    "@getanbo/plugin-cloud": "0.1.0",
+    "@getanbo/plugin-ministack": "0.1.0"
+  },
   "engines": {
     "node": ">=20"
   },

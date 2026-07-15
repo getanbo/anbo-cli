@@ -60,7 +60,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
         }
         value = next;
         index += 1;
-      } else if (value === true) {
+      } else if (value === true && !isBooleanFlag(name)) {
         const next = normalized.args[index + 1];
         if (next !== undefined && !next.startsWith("-") && command !== undefined) {
           value = next;
@@ -132,6 +132,10 @@ function parseOutput(value: string): OutputMode {
 
 function expectsValue(name: string): boolean {
   return new Set(["target", "root", "output"]).has(name);
+}
+
+function isBooleanFlag(name: string): boolean {
+  return new Set(["dry-run", "follow", "force", "purge", "test", "wait", "yes"]).has(name);
 }
 
 function addFlag(

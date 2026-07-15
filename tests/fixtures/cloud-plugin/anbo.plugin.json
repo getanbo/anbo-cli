@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "plugin_api": 1,
+  "id": "anbo.cloud",
+  "package": "@getanbo/plugin-cloud",
+  "version": "0.1.0",
+  "entrypoint": "./index.mjs",
+  "engines": { "anbo": ">=0.2.0 <0.3.0", "node": ">=20.0.0" },
+  "kinds": ["target", "commands"],
+  "targets": [{
+    "id": "cloud",
+    "actions": ["configure", "deploy", "status", "test", "logs", "debug", "down", "capabilities"]
+  }],
+  "commands": ["cloud.branch", "cloud.token", "cloud.sql", "cloud.report", "cloud.test-status"],
+  "config": { "schema": "./config.schema.json", "schema_version": 1 },
+  "capabilities": ["acceptance.cloud"]
+}
