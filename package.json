@@ -1,0 +1,76 @@
+{
+  "name": "@getanbo/plugin-ministack",
+  "version": "0.1.0",
+  "description": "Anbo target plugin for deterministic local AWS environments powered by Anbo MiniStack",
+  "type": "module",
+  "types": "dist/src/plugin.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/plugin.d.ts",
+      "import": "./dist/src/plugin.js",
+      "default": "./dist/src/plugin.js"
+    },
+    "./descriptor": "./anbo.plugin.json",
+    "./schemas/*": "./schemas/*"
+  },
+  "files": [
+    "dist/src",
+    "dist/runtime-manifest.json",
+    "schemas",
+    "anbo.plugin.json",
+    "runtime-manifest.json",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@getanbo/plugin-sdk": ">=0.2.0 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@getanbo/plugin-sdk": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getanbo/anbo-plugin-ministack.git"
+  },
+  "homepage": "https://github.com/getanbo/anbo-plugin-ministack#readme",
+  "bugs": {
+    "url": "https://github.com/getanbo/anbo-plugin-ministack/issues"
+  },
+  "keywords": [
+    "anbo",
+    "aws",
+    "ministack",
+    "terraform",
+    "plugin"
+  ],
+  "packageManager": "npm@11.6.2",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/copy-schemas.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "test:package": "node scripts/verify-package.mjs",
+    "test:conformance": "node scripts/run-conformance.mjs",
+    "test:installed-cli": "node scripts/run-installed-cli-acceptance.mjs",
+    "audit": "npm audit --audit-level=high",
+    "verify": "npm run audit && npm run typecheck && npm test && npm run test:package && npm run test:conformance",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run verify"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  },
+  "license": "MIT"
+}

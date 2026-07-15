@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/getanbo/anbo-plugin-ministack/v0.1.0/schemas/plugin-config.v1.schema.json",
+  "title": "Anbo MiniStack Plugin Configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "manifest": {
+      "type": "string",
+      "minLength": 1,
+      "default": ".anbo/sandbox.json",
+      "description": "Project-relative MiniStack sandbox manifest path."
+    }
+  }
+}

@@ -132,11 +132,11 @@ return typed bindings and diagnostics. See [Adapter protocol v2](docs/adapters-v
 ## Runtime Pin
 
 [`runtime-manifest.json`](runtime-manifest.json) is the single audited runtime
-pin. The initial source is marked `upstream-bootstrap` and uses the certified
-MiniStack v1.4.2 full-image digest. It must be replaced by an immutable
-`ghcr.io/getanbo/anbo-ministack@sha256:...` index digest after the first Anbo
-MiniStack candidate passes the installed-CLI acceptance suite. Mutable tags are
-never accepted as the release pin.
+pin. It records the upstream MiniStack commit, the downstream Anbo MiniStack
+build commit, and the exact multi-platform image index certified by the
+installed-CLI acceptance suite. The configured runtime is always the immutable
+`ghcr.io/getanbo/anbo-ministack@sha256:...` reference; mutable tags are never
+accepted as the release pin.
 
 ## Development
 

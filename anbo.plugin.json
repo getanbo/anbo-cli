@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/plugin.v1.schema.json",
+  "schema_version": 1,
+  "plugin_api": 1,
+  "id": "anbo.ministack",
+  "package": "@getanbo/plugin-ministack",
+  "name": "Anbo MiniStack",
+  "version": "0.1.0",
+  "entrypoint": "./dist/src/plugin.js",
+  "engines": {
+    "anbo": ">=0.2.0 <0.3.0",
+    "node": ">=22.0.0"
+  },
+  "kinds": ["target"],
+  "targets": ["ministack"],
+  "actions": [
+    "configure",
+    "deploy",
+    "status",
+    "test",
+    "logs",
+    "debug",
+    "down",
+    "capabilities",
+    "cache"
+  ],
+  "config": {
+    "schema": "./schemas/plugin-config.v1.schema.json",
+    "schema_version": 1
+  },
+  "capabilities": [
+    "terraform.discovery",
+    "terraform.aws.apply",
+    "ministack.runtime",
+    "data.clone.postgres",
+    "data.clone.dynamodb",
+    "build.cache",
+    "smoke.test",
+    "structured.logs",
+    "adapter.v2"
+  ]
+}
