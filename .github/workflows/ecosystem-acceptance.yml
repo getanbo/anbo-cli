@@ -56,24 +56,28 @@ jobs:
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
-      - name: Build source packages
-        run: |
-          npm ci --prefix cli
-          npm run build --prefix cli
-          npm ci --prefix plugin-ministack
-          npm run build --prefix plugin-ministack
-          npm ci --prefix plugin-cloud
-          npm run build --prefix plugin-cloud
-      - name: Pack exact candidates
+      - name: Build and pack the canonical host
         run: |
           mkdir -p artifacts diagnostics install projects/ministack projects/cloud
+          npm ci --prefix cli
+          npm run build --prefix cli
+          npm pack --prefix cli --workspace packages/plugin-sdk --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --prefix cli --workspace packages/plugin-testkit --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --prefix cli --workspace packages/cli --pack-destination "$GITHUB_WORKSPACE/artifacts"
+      - name: Build plugins against the candidate SDK
+        run: |
+          npm ci --prefix plugin-ministack
+          npm install --prefix plugin-ministack --no-save --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          npm run build --prefix plugin-ministack
+          npm ci --prefix plugin-cloud
+          npm install --prefix plugin-cloud --no-save --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          npm run build --prefix plugin-cloud
+      - name: Pack exact plugin candidates
+        run: |
           printf '{"cli":"%s","ministack_plugin":"%s","cloud_plugin":"%s"}\n' \
             "$GITHUB_SHA" \
             "${{ steps.ministack-checkout.outputs.commit }}" \
             "${{ steps.cloud-checkout.outputs.commit }}" > diagnostics/candidates.json
-          npm pack --prefix cli --workspace packages/plugin-sdk --pack-destination "$GITHUB_WORKSPACE/artifacts"
-          npm pack --prefix cli --workspace packages/plugin-testkit --pack-destination "$GITHUB_WORKSPACE/artifacts"
-          npm pack --prefix cli --workspace packages/cli --pack-destination "$GITHUB_WORKSPACE/artifacts"
           npm pack ./plugin-ministack --pack-destination "$GITHUB_WORKSPACE/artifacts"
           npm pack ./plugin-cloud --pack-destination "$GITHUB_WORKSPACE/artifacts"
       - name: Install candidates into an empty prefix

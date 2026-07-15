@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { validateDescriptor } from "../../packages/cli/dist/index.js";
-import { redactObject, redactText } from "../../packages/cli/dist/redaction.js";
+import { redactArgv, redactObject, redactText } from "../../packages/cli/dist/redaction.js";
 
 const descriptor = {
   schema_version: 1,
@@ -28,4 +28,14 @@ test("redaction covers structured and textual credentials", () => {
     token: "[REDACTED]",
     nested: { password: "[REDACTED]" },
   });
+});
+
+test("argv redaction covers separate and inline sensitive flags", () => {
+  assert.deepEqual(
+    redactArgv(["configure", "--token", "one-secret", "--api-key=two-secret", "--project", "notes"]),
+    {
+      argv: ["configure", "--token", "[REDACTED]", "--api-key=[REDACTED]", "--project", "notes"],
+      secrets: ["one-secret", "two-secret"],
+    },
+  );
 });

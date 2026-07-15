@@ -19,6 +19,7 @@ import {
   loadAndActivatePlugin,
   lockLoadedPlugin,
 } from "./plugins.js";
+import { redactArgv } from "./redaction.js";
 
 export interface CliDependencies {
   cwd?: string;
@@ -48,6 +49,8 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   if (dependencies.signal?.aborted) upstreamAbort();
   const runId = randomUUID();
   const writer = new EventWriter(runId, parsed.command, parsed.target, parsed.output, writeOut);
+  const safeArguments = redactArgv(parsed.raw);
+  for (const secret of safeArguments.secrets) writer.addSecret(secret);
   const started = performance.now();
   let cancellationEmitted = false;
   const emitCancellation = () => {
@@ -64,7 +67,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
   writer.emit({
     type: "run.started",
     message: `anbo ${parsed.command} started`,
-    data: { argv: parsed.raw, output: parsed.output },
+    data: { argv: safeArguments.argv, output: parsed.output },
   });
 
   let exitCode: number = EXIT_CODE.success;

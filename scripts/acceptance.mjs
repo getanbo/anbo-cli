@@ -48,7 +48,12 @@ try {
   assert.equal(listEvent.data.plugins.every((plugin) => plugin.installed), true);
 
   await cli(["doctor", "--root", projectRoot]);
-  await cli(["configure", "--target", "ministack", "--root", projectRoot]);
+  const configureToken = "acceptance-configure-token-value";
+  const configured = await cli([
+    "configure", "--target", "ministack", "--root", projectRoot, "--token", configureToken,
+  ]);
+  assert.equal(`${configured.stdout}${configured.stderr}`.includes(configureToken), false);
+  assert.equal(configured.stdout.includes("[REDACTED]"), true);
   const lock = JSON.parse(await readFile(join(projectRoot, ".anbo", "plugins.lock.json"), "utf8"));
   assert.equal(lock.plugins.ministack.version, "0.1.0");
   assert.match(lock.plugins.ministack.integrity, /^sha512-/u);
