@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Ajv2020 } from "ajv/dist/2020.js";
+import { satisfies } from "semver";
 import type {
   AnboPluginLock,
   AnboPluginV1,
@@ -33,6 +34,14 @@ interface ExecutableTarget {
   execute(request: TargetRequestV1): Promise<TargetResultV1>;
 }
 
+interface ResolvedPluginPackage {
+  root: string;
+  name: string;
+  version: string;
+  entrypoint: string;
+  descriptor: string;
+}
+
 type ExecutableCommand = (request: PluginCommandRequestV1) => Promise<TargetResultV1>;
 
 export interface LoadedPlugin {
@@ -57,17 +66,15 @@ export async function loadAndActivatePlugin(input: {
   if (!mapping) {
     throw new PluginUnavailableError(input.target, "<package mapped in .anbo/project.json>");
   }
-  const modulePath = resolvePluginArtifact(mapping.package, input.rootDir);
-  const manifestPath = resolvePluginArtifact(mapping.package, input.rootDir, "descriptor");
-  if (!modulePath || !manifestPath) throw new PluginUnavailableError(input.target, mapping.package);
+  const resolvedPackage = resolvePluginPackage(mapping.package, input.rootDir);
+  if (!resolvedPackage) throw new PluginUnavailableError(input.target, mapping.package);
 
-  const packageMetadata = await findPackageMetadata(modulePath, mapping.package);
-  const manifest = await readDescriptor(manifestPath);
+  const manifest = await readDescriptor(resolvedPackage.descriptor);
   validateDescriptor(manifest, input.target, mapping.package);
-  validatePackageIdentity(manifest, packageMetadata, mapping.package);
-  await validateConfigSchema(manifest, packageMetadata.root, mapping.config ?? {});
+  validatePackageIdentity(manifest, resolvedPackage, mapping.package);
+  await validateConfigSchema(manifest, resolvedPackage.root, mapping.config ?? {});
 
-  const imported = (await import(pathToFileURL(modulePath).href)) as Record<string, unknown>;
+  const imported = (await import(pathToFileURL(resolvedPackage.entrypoint).href)) as Record<string, unknown>;
   const candidate = imported.default ?? imported.plugin;
   if (!isPlugin(candidate)) {
     throw new PluginCompatibilityError(
@@ -77,7 +84,7 @@ export async function loadAndActivatePlugin(input: {
   validateDescriptor(candidate.descriptor, input.target, mapping.package);
   validateDescriptorAgreement(manifest, candidate.descriptor, mapping.package);
 
-  const integrity = await findInstalledIntegrity(packageMetadata.root, mapping.package);
+  const integrity = await findInstalledIntegrity(resolvedPackage.root, mapping.package);
   validateLock(
     input.lock,
     input.target,
@@ -98,7 +105,7 @@ export async function loadAndActivatePlugin(input: {
     plugin: candidate,
     runtime,
     packageName: mapping.package,
-    packageRoot: packageMetadata.root,
+    packageRoot: resolvedPackage.root,
     manifest,
     ...(integrity ? { integrity } : {}),
   };
@@ -196,12 +203,12 @@ export function validateDescriptor(
   if (!validId.test(descriptor.id) || !validVersion.test(descriptor.version)) {
     throw new PluginCompatibilityError(`${packageName} has an invalid descriptor identity.`);
   }
-  if (!descriptor.engines?.anbo || !supportsVersion(descriptor.engines.anbo, CLI_VERSION)) {
+  if (!descriptor.engines?.anbo || !satisfies(CLI_VERSION, descriptor.engines.anbo)) {
     throw new PluginCompatibilityError(
       `${packageName}@${descriptor.version} requires anbo ${descriptor.engines?.anbo ?? "<missing>"}; running ${CLI_VERSION}.`,
     );
   }
-  if (descriptor.engines.node && !supportsVersion(descriptor.engines.node, process.versions.node)) {
+  if (descriptor.engines.node && !satisfies(process.versions.node, descriptor.engines.node)) {
     throw new PluginCompatibilityError(
       `${packageName}@${descriptor.version} requires Node.js ${descriptor.engines.node}; running ${process.versions.node}.`,
     );
@@ -356,24 +363,97 @@ async function createPluginContext(
   };
 }
 
-function resolvePluginArtifact(
+export function isPluginPackageInstalled(packageName: string, rootDir: string): boolean {
+  return resolvePluginPackage(packageName, rootDir) !== undefined;
+}
+
+function resolvePluginPackage(
   packageName: string,
   rootDir: string,
-  subpath?: string,
-): string | undefined {
-  const specifier = subpath ? `${packageName}/${subpath}` : packageName;
-  const projectRequire = createRequire(join(rootDir, "package.json"));
-  for (const attempt of [
-    () => projectRequire.resolve(specifier, { paths: [rootDir, process.cwd(), CLI_PACKAGE_ROOT] }),
-    () => createRequire(import.meta.url).resolve(specifier),
-  ]) {
-    try {
-      return attempt();
-    } catch (error) {
-      if (!isModuleNotFound(error)) throw error;
+): ResolvedPluginPackage | undefined {
+  const packageRoot = findPackageRoot(packageName, [rootDir, process.cwd(), CLI_PACKAGE_ROOT]);
+  if (!packageRoot) return undefined;
+  let metadata: {
+    name?: string;
+    version?: string;
+    main?: string;
+    module?: string;
+    exports?: unknown;
+  };
+  try {
+    metadata = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as typeof metadata;
+  } catch {
+    return undefined;
+  }
+  if (metadata.name !== packageName || !metadata.version) return undefined;
+  const entrypoint = resolveExport(packageRoot, metadata, ".");
+  const descriptor = resolveExport(packageRoot, metadata, "./descriptor");
+  if (!entrypoint || !descriptor) return undefined;
+  return { root: packageRoot, name: metadata.name, version: metadata.version, entrypoint, descriptor };
+}
+
+function findPackageRoot(packageName: string, starts: string[]): string | undefined {
+  const packageSegments = packageName.split("/");
+  const visited = new Set<string>();
+  for (const start of starts) {
+    let current = resolve(start);
+    while (true) {
+      const candidate = join(current, "node_modules", ...packageSegments);
+      if (!visited.has(candidate)) {
+        visited.add(candidate);
+        if (existsSync(join(candidate, "package.json"))) return realpathSync(candidate);
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
     }
   }
   return undefined;
+}
+
+function resolveExport(
+  packageRoot: string,
+  metadata: { main?: string; module?: string; exports?: unknown },
+  subpath: "." | "./descriptor",
+): string | undefined {
+  let target: string | undefined;
+  if (metadata.exports !== undefined) {
+    const exports = metadata.exports;
+    const selected = subpath === "." && !hasSubpathKeys(exports)
+      ? exports
+      : isRecord(exports)
+        ? exports[subpath]
+        : undefined;
+    target = selectImportTarget(selected);
+  } else if (subpath === ".") {
+    target = metadata.module ?? metadata.main ?? "./index.js";
+  }
+  if (!target || !target.startsWith("./")) return undefined;
+  const absolute = resolve(packageRoot, target);
+  const outside = relative(packageRoot, absolute);
+  if (outside.startsWith("..") || outside.startsWith("/") || !existsSync(absolute)) return undefined;
+  return absolute;
+}
+
+function selectImportTarget(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    for (const candidate of value) {
+      const selected = selectImportTarget(candidate);
+      if (selected) return selected;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  for (const condition of ["import", "node", "default"]) {
+    const selected = selectImportTarget(value[condition]);
+    if (selected) return selected;
+  }
+  return undefined;
+}
+
+function hasSubpathKeys(value: unknown): boolean {
+  return isRecord(value) && Object.keys(value).some((key) => key.startsWith("."));
 }
 
 async function readDescriptor(path: string): Promise<PluginDescriptorV1> {
@@ -384,30 +464,6 @@ async function readDescriptor(path: string): Promise<PluginDescriptorV1> {
       `Could not read static plugin descriptor ${path}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-}
-
-async function findPackageMetadata(
-  modulePath: string,
-  expectedName: string,
-): Promise<{ root: string; name: string; version: string }> {
-  let current = dirname(modulePath);
-  while (true) {
-    try {
-      const value = JSON.parse(await readFile(join(current, "package.json"), "utf8")) as {
-        name?: string;
-        version?: string;
-      };
-      if (value.name === expectedName && value.version) {
-        return { root: current, name: value.name, version: value.version };
-      }
-    } catch (error) {
-      if (!isMissingFile(error) && !(error instanceof SyntaxError)) throw error;
-    }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  throw new PluginCompatibilityError(`Could not verify package identity for ${expectedName}.`);
 }
 
 function validatePackageIdentity(
@@ -525,28 +581,6 @@ function emitDiagnostics(result: TargetResultV1, writer: EventWriter, source: st
   }
 }
 
-function supportsVersion(range: string, version: string): boolean {
-  if (range === "*" || range === "latest" || range === version) return true;
-  const current = version.split(".").map(Number);
-  if (range.startsWith("^")) {
-    const requested = range.slice(1).split(".").map(Number);
-    return requested[0] === current[0] && (current[0] !== 0 || requested[1] === current[1]);
-  }
-  const minimum = range.match(/>=\s*(\d+)\.(\d+)\.(\d+)/u)?.slice(1).map(Number);
-  const maximum = range.match(/<\s*(\d+)(?:\.(\d+)\.(\d+))?/u)?.slice(1).map((value) => Number(value ?? 0));
-  if (minimum && compareVersions(current, minimum) < 0) return false;
-  if (maximum && compareVersions(current, maximum) >= 0) return false;
-  return Boolean(minimum || maximum);
-}
-
-function compareVersions(left: number[], right: number[]): number {
-  for (let index = 0; index < 3; index += 1) {
-    const difference = (left[index] ?? 0) - (right[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  return 0;
-}
-
 function validActions(actions: readonly TargetActionV1[]): boolean {
   return Array.isArray(actions) && actions.every((action) => TARGET_ACTIONS.includes(action));
 }
@@ -607,8 +641,8 @@ function isPlugin(value: unknown): value is AnboPluginV1 {
   );
 }
 
-function isModuleNotFound(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "MODULE_NOT_FOUND";
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isMissingFile(error: unknown): boolean {

@@ -76,6 +76,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
         output = parseOutput(value);
       } else {
         addFlag(flags, name, value);
+        if (namePart.startsWith("no-")) addFlag(flags, namePart, true);
       }
       continue;
     }

@@ -9,6 +9,7 @@ test("sandbox up aliases deploy without losing machine options", () => {
   assert.equal(parsed.target, "ministack");
   assert.equal(parsed.output, "jsonl");
   assert.equal(parsed.flags.test, false);
+  assert.equal(parsed.flags["no-test"], true);
 });
 
 test("plugin child command boundary remains explicit", () => {

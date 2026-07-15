@@ -5,7 +5,7 @@
   "package": "@getanbo/plugin-cloud",
   "version": "0.1.0",
   "entrypoint": "./index.mjs",
-  "engines": { "anbo": ">=0.2.0 <0.3.0", "node": ">=20.0.0" },
+  "engines": { "anbo": ">=0.2 <0.3", "node": ">=22" },
   "kinds": ["target", "commands"],
   "targets": [{
     "id": "cloud",

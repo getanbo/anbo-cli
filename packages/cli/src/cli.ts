@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { createRequire } from "node:module";
-import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { JsonObject, JsonValue, TargetActionV1, TargetResultV1 } from "@getanbo/plugin-sdk";
 import { parseCliArgs, type ParsedCliArgs } from "./args.js";
@@ -17,6 +15,7 @@ import { EventWriter } from "./events.js";
 import {
   executePluginCommand,
   executeTarget,
+  isPluginPackageInstalled,
   loadAndActivatePlugin,
   lockLoadedPlugin,
 } from "./plugins.js";
@@ -232,7 +231,7 @@ async function runPluginCommand(
       id,
       package: packageName,
       configured: Boolean(configured[id]),
-      installed: packageName ? packageInstalled(packageName, rootDir) : false,
+      installed: packageName ? isPluginPackageInstalled(packageName, rootDir) : false,
       firstParty: Boolean(FIRST_PARTY_PLUGINS[id]),
     };
   });
@@ -333,22 +332,6 @@ function routePluginCommand(parsed: ParsedCliArgs): {
     args: parsed.positionals,
     passthrough: parsed.passthrough,
   };
-}
-
-function packageInstalled(packageName: string, rootDir: string): boolean {
-  const require = createRequire(join(rootDir, "package.json"));
-  for (const resolvePackage of [
-    () => require.resolve(packageName, { paths: [rootDir, process.cwd()] }),
-    () => createRequire(import.meta.url).resolve(packageName),
-  ]) {
-    try {
-      resolvePackage();
-      return true;
-    } catch {
-      // Try the next deterministic install location.
-    }
-  }
-  return false;
 }
 
 function normalizeError(error: unknown, aborted: boolean): AnboError {
