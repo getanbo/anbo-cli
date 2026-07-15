@@ -1,7 +1,10 @@
-import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import type { CommandExecutor, RuntimeCommandOptions, RuntimeCommandResult } from "./ministack.js";
 import { ProcessCommandExecutor } from "./ministack.js";
+import { assertTerraformTreeRoot, terraformLockCacheKey, terraformTreePathExcluded } from "./terraform-reconciliation.js";
 
 /** Endpoint names published by MiniStack's Terraform v5/v6 configuration. */
 export const MINISTACK_TERRAFORM_ENDPOINTS = [
@@ -14,10 +17,14 @@ export const MINISTACK_TERRAFORM_ENDPOINTS = [
 ] as const;
 
 export interface TerraformRunConfig {
+  projectDirectory: string;
   sourceDirectory: string;
   privateDirectory: string;
   statePath: string;
   pluginCacheDirectory: string;
+  lockCacheDirectory?: string;
+  excludedPaths?: readonly string[];
+  cachedLockPath?: string;
   workerImage: string;
   networkName: string;
   miniStackEndpoint: string;
@@ -48,6 +55,25 @@ export interface TerraformRunResult {
 export interface TerraformDependencies {
   commands?: CommandExecutor;
   onOutput?: (stream: "stdout" | "stderr", text: string, phase: string) => void | Promise<void>;
+  onLifecycle?: (event: TerraformLifecycleEvent) => void | Promise<void>;
+}
+
+export type TerraformLifecyclePhase =
+  | "terraform.fingerprint"
+  | "terraform.workspace.prepare"
+  | "terraform.init"
+  | "terraform.validate"
+  | "terraform.plan"
+  | "terraform.show"
+  | "terraform.apply"
+  | "terraform.output";
+
+export interface TerraformLifecycleEvent {
+  phase: TerraformLifecyclePhase;
+  status: "started" | "succeeded" | "failed" | "skipped";
+  durationMs?: number;
+  exitCode?: number;
+  reason?: string;
 }
 
 interface HostIdentity {
@@ -83,6 +109,7 @@ export async function prepareTerraformWorkspace(config: TerraformRunConfig): Pro
   if (source === destination || destination.startsWith(source + sep)) {
     throw new Error("private Terraform workspace must be outside the source Terraform root");
   }
+  await assertTerraformTreeRoot(config.projectDirectory, source);
   if ((await listTerraformFiles(source)).some((path) => basename(path) === "zz_anbo_ministack_override.tf")) {
     throw new Error("Terraform root contains reserved file zz_anbo_ministack_override.tf");
   }
@@ -91,12 +118,15 @@ export async function prepareTerraformWorkspace(config: TerraformRunConfig): Pro
   await mkdir(destination, { recursive: true });
   await cp(source, destination, {
     recursive: true,
-    filter: (entry) => {
-      const name = basename(entry);
-      return name !== ".terraform" && name !== ".anbo" &&
-        name !== "terraform.tfstate" && name !== "terraform.tfstate.backup";
-    },
+    filter: async (entry) => entry === source || !await terraformTreePathExcluded(entry, config.excludedPaths ?? []),
   });
+  if (config.cachedLockPath !== undefined) {
+    try {
+      await writeFile(join(destination, ".terraform.lock.hcl"), await readFile(config.cachedLockPath), { mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
   await replaceBackendsWithLocal(destination, `/anbo-state/${basename(config.statePath)}`);
   await writeMiniStackProviderOverride(
     destination,
@@ -116,9 +146,16 @@ export async function runTerraform(
     throw new Error("host Terraform fallback cannot provide network isolation and is intentionally unsupported");
   }
   const commands = dependencies.commands ?? new ProcessCommandExecutor();
+  await assertTerraformTreeRoot(config.projectDirectory, config.sourceDirectory);
   await mkdir(config.pluginCacheDirectory, { recursive: true });
+  const lockCacheDirectory = config.lockCacheDirectory ?? join(dirname(config.pluginCacheDirectory), "locks");
+  const lockCacheKey = await terraformLockCacheKey(config.sourceDirectory, config.workerImage);
+  const lockCachePath = lockCacheKey === undefined ? undefined : join(lockCacheDirectory, lockCacheKey, ".terraform.lock.hcl");
+  if (lockCachePath !== undefined) await mkdir(dirname(lockCachePath), { recursive: true, mode: 0o700 });
   await mkdir(dirname(config.statePath), { recursive: true });
-  await prepareTerraformWorkspace(config);
+  await runLifecycleStep("terraform.workspace.prepare", dependencies.onLifecycle, async () => {
+    await prepareTerraformWorkspace({ ...config, ...(lockCachePath === undefined ? {} : { cachedLockPath: lockCachePath }) });
+  });
 
   const initEnvironment = scrubTerraformEnvironment(config.environment ?? process.env, false);
   const isolatedEnvironment = terraformMiniStackEnvironment(
@@ -132,12 +169,15 @@ export async function runTerraform(
     network: "bridge",
     phase: "terraform.init",
     onOutput: dependencies.onOutput,
+    onLifecycle: dependencies.onLifecycle,
   });
+  if (lockCachePath !== undefined) await persistTerraformLock(join(config.privateDirectory, ".terraform.lock.hcl"), lockCachePath);
   await runTerraformWorker(commands, config, ["validate", "-no-color"], {
     environment: isolatedEnvironment,
     network: config.networkName,
     phase: "terraform.validate",
     onOutput: dependencies.onOutput,
+    onLifecycle: dependencies.onLifecycle,
   });
 
   const planPath = join(config.privateDirectory, ".anbo.plan");
@@ -150,25 +190,37 @@ export async function runTerraform(
     network: config.networkName,
     phase: "terraform.plan",
     allowedExitCodes: [0, 2],
+    onLifecycle: dependencies.onLifecycle,
   });
   if (dependencies.onOutput !== undefined) {
     await dependencies.onOutput("stdout", summarizeTerraformPlan(plan.stdout, plan.code), "terraform.plan");
   }
   const changes = plan.code === 0
     ? emptyChangeSummary()
-    : await inspectTerraformPlan(commands, config, isolatedEnvironment);
+    : await inspectTerraformPlan(commands, config, isolatedEnvironment, dependencies.onLifecycle);
 
-  // Applying the saved filename, rather than re-planning, is a safety invariant.
-  await runTerraformWorker(commands, config, ["apply", "-input=false", "-no-color", "/workspace/.anbo.plan"], {
-    environment: isolatedEnvironment,
-    network: config.networkName,
-    phase: "terraform.apply",
-    onOutput: dependencies.onOutput,
-  });
+  if (plan.code === 0) {
+    await dependencies.onLifecycle?.({
+      phase: "terraform.apply",
+      status: "skipped",
+      durationMs: 0,
+      reason: "terraform_plan_empty",
+    });
+  } else {
+    // Applying the saved filename, rather than re-planning, is a safety invariant.
+    await runTerraformWorker(commands, config, ["apply", "-input=false", "-no-color", "/workspace/.anbo.plan"], {
+      environment: isolatedEnvironment,
+      network: config.networkName,
+      phase: "terraform.apply",
+      onOutput: dependencies.onOutput,
+      onLifecycle: dependencies.onLifecycle,
+    });
+  }
   const outputResult = await runTerraformWorker(commands, config, ["output", "-json"], {
     environment: isolatedEnvironment,
     network: config.networkName,
     phase: "terraform.output",
+    onLifecycle: dependencies.onLifecycle,
   });
   return {
     privateDirectory: config.privateDirectory,
@@ -303,6 +355,7 @@ async function runTerraformWorker(
     network: string;
     phase: string;
     onOutput?: (stream: "stdout" | "stderr", text: string, phase: string) => void | Promise<void>;
+    onLifecycle?: (event: TerraformLifecycleEvent) => void | Promise<void>;
     allowedExitCodes?: readonly number[];
   },
 ): Promise<RuntimeCommandResult> {
@@ -324,13 +377,50 @@ async function runTerraformWorker(
     ...(config.signal === undefined ? {} : { signal: config.signal }),
     ...(options.onOutput === undefined ? {} : { onOutput: (stream: "stdout" | "stderr", text: string) => options.onOutput?.(stream, text, options.phase) }),
   };
-  const result = await commands.run("docker", args, commandOptions);
-  const allowed = options.allowedExitCodes ?? [0];
-  if (!allowed.includes(result.code)) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
-    throw new Error(`${options.phase} failed: ${detail}`);
+  const phase = options.phase as TerraformLifecyclePhase;
+  await options.onLifecycle?.({ phase, status: "started" });
+  const started = performance.now();
+  let result: RuntimeCommandResult | undefined;
+  try {
+    result = await commands.run("docker", args, commandOptions);
+    const allowed = options.allowedExitCodes ?? [0];
+    if (!allowed.includes(result.code)) {
+      const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+      throw new Error(`${options.phase} failed: ${detail}`);
+    }
+    await options.onLifecycle?.({
+      phase,
+      status: "succeeded",
+      durationMs: elapsedMilliseconds(started),
+      exitCode: result.code,
+    });
+    return result;
+  } catch (cause) {
+    await options.onLifecycle?.({
+      phase,
+      status: "failed",
+      durationMs: elapsedMilliseconds(started),
+      ...(result === undefined ? {} : { exitCode: result.code }),
+    });
+    throw cause;
   }
-  return result;
+}
+
+async function persistTerraformLock(source: string, destination: string): Promise<void> {
+  let contents: Buffer;
+  try { contents = await readFile(source); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, contents, { mode: 0o600, flag: "wx" });
+    await rename(temporary, destination);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 function currentHostIdentity(): HostIdentity {
@@ -344,13 +434,13 @@ async function inspectTerraformPlan(
   commands: CommandExecutor,
   config: TerraformRunConfig,
   environment: NodeJS.ProcessEnv,
-  onOutput?: (stream: "stdout" | "stderr", text: string, phase: string) => void | Promise<void>,
+  onLifecycle?: (event: TerraformLifecycleEvent) => void | Promise<void>,
 ): Promise<TerraformChangeSummary> {
   const result = await runTerraformWorker(commands, config, ["show", "-json", "/workspace/.anbo.plan"], {
     environment,
     network: config.networkName,
     phase: "terraform.show",
-    ...(onOutput === undefined ? {} : { onOutput }),
+    ...(onLifecycle === undefined ? {} : { onLifecycle }),
   });
   const plan = JSON.parse(result.stdout) as unknown;
   if (!isRecord(plan) || !Array.isArray(plan["resource_changes"])) return emptyChangeSummary();
@@ -365,6 +455,27 @@ async function inspectTerraformPlan(
     else summary.noOp += 1;
   }
   return summary;
+}
+
+async function runLifecycleStep<T>(
+  phase: TerraformLifecyclePhase,
+  onLifecycle: TerraformDependencies["onLifecycle"],
+  operation: () => Promise<T>,
+): Promise<T> {
+  await onLifecycle?.({ phase, status: "started" });
+  const started = performance.now();
+  try {
+    const result = await operation();
+    await onLifecycle?.({ phase, status: "succeeded", durationMs: elapsedMilliseconds(started) });
+    return result;
+  } catch (cause) {
+    await onLifecycle?.({ phase, status: "failed", durationMs: elapsedMilliseconds(started) });
+    throw cause;
+  }
+}
+
+function elapsedMilliseconds(started: number): number {
+  return Math.max(0, Math.round(performance.now() - started));
 }
 
 function resolveVariableArguments(config: TerraformRunConfig): string[] {
@@ -538,7 +649,7 @@ function walkJson(value: unknown, visitor: (key: string) => void): void {
 async function listTerraformFiles(root: string): Promise<string[]> {
   const files: string[] = [];
   for (const entry of await readdir(root, { withFileTypes: true })) {
-    if (entry.name === ".terraform" || entry.name === ".anbo" || entry.name === "node_modules") continue;
+    if (entry.name === ".git" || entry.name === ".terraform" || entry.name === ".anbo" || entry.name === "node_modules") continue;
     const path = join(root, entry.name);
     if (entry.isDirectory()) files.push(...await listTerraformFiles(path));
     else if (entry.isFile() && (entry.name.endsWith(".tf") || entry.name.endsWith(".tf.json"))) files.push(path);

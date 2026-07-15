@@ -81,6 +81,12 @@ export interface MiniStackRuntimeConfig {
 
 export interface MiniStackRuntime {
   containerName: string;
+  /** Docker generation identity. Missing identities are never eligible for incremental reuse. */
+  containerId?: string;
+  /** Docker process generation. A restart keeps the container ID but changes this value. */
+  runtimeGeneration?: string;
+  /** True only when the exact healthy running container was reused without a restart. */
+  reused: boolean;
   /** Internal network used only by the isolated Terraform worker. */
   networkName: string;
   /** Egress-capable network used by MiniStack's Lambda and ECS containers. */
@@ -157,6 +163,10 @@ export async function startMiniStack(
     lambdaDockerFlags,
   });
   let hostPort: number | undefined;
+  let containerId: string | undefined;
+  let runtimeGeneration: string | undefined;
+  let reused = false;
+  let createRequired = false;
 
   await ensureDockerNetwork(commands, networkName, label, true, dependencies.signal);
   await ensureDockerNetwork(commands, runtimeNetworkName, label, false, dependencies.signal);
@@ -176,18 +186,25 @@ export async function startMiniStack(
         inspected.Config?.Labels?.[RUNTIME_CONFIG_LABEL] !== runtimeConfigFingerprint ||
         !hasContainerHostRouting(inspected, lambdaDockerFlags)) {
       await checked(commands, "docker", ["rm", "-f", containerName], signalOptions(dependencies.signal));
+      createRequired = true;
     } else if (!inspected.State?.Running && (inspected.State?.ExitCode ?? 0) !== 0) {
       await checked(commands, "docker", ["rm", "-f", containerName], signalOptions(dependencies.signal));
+      createRequired = true;
     } else {
       hostPort = configuredHostPort(inspected);
+      containerId = inspected.Id;
+      runtimeGeneration = inspected.State?.StartedAt;
       if (!inspected.State?.Running) {
         await checked(commands, "docker", ["start", containerName], signalOptions(dependencies.signal));
+      } else {
+        reused = hasRuntimeIdentity(containerId, runtimeGeneration);
       }
     }
+  } else {
+    createRequired = true;
   }
 
-  const afterInspect = await commands.run("docker", ["inspect", containerName], signalOptions(dependencies.signal));
-  if (afterInspect.code !== 0) {
+  if (createRequired) {
     const dockerSocket = config.dockerSocket ?? "/var/run/docker.sock";
     hostPort = await reserveLoopbackPort();
     const args = [
@@ -217,7 +234,8 @@ export async function startMiniStack(
       ...environmentArguments(config.environment, new Set(["LAMBDA_DOCKER_FLAGS"])),
       image,
     ];
-    await checked(commands, "docker", args, signalOptions(dependencies.signal));
+    const created = await checked(commands, "docker", args, signalOptions(dependencies.signal));
+    containerId = created.stdout.trim().split(/\s+/)[0] || undefined;
     await checked(
       commands,
       "docker",
@@ -226,10 +244,7 @@ export async function startMiniStack(
     );
   }
 
-  if (hostPort === undefined) {
-    const inspection = await checked(commands, "docker", ["inspect", containerName], signalOptions(dependencies.signal));
-    hostPort = configuredHostPort(parseDockerInspection(inspection.stdout));
-  }
+  if (hostPort === undefined) throw new Error("MiniStack container has no loopback port binding");
   const hostEndpoint = `http://127.0.0.1:${hostPort}`;
   const deadline = now() + (config.healthTimeoutMs ?? 60_000);
   let lastFailure = "health endpoint did not respond";
@@ -239,8 +254,23 @@ export async function startMiniStack(
       const response = await fetcher(`${hostEndpoint}/_ministack/health`, { signal: dependencies.signal });
       const body = await response.json() as Record<string, unknown>;
       if (response.ok && body["edition"] === "full") {
+        const healthyInspection = parseDockerInspection((await checked(
+          commands,
+          "docker",
+          ["inspect", containerName],
+          signalOptions(dependencies.signal),
+        )).stdout);
+        if (healthyInspection.State?.Running !== true) throw new Error("MiniStack container stopped during its health check");
+        if (reused && (healthyInspection.Id !== containerId || healthyInspection.State.StartedAt !== runtimeGeneration)) {
+          reused = false;
+        }
+        containerId = healthyInspection.Id ?? containerId;
+        runtimeGeneration = healthyInspection.State.StartedAt;
         return {
           containerName,
+          ...(containerId === undefined ? {} : { containerId }),
+          ...(runtimeGeneration === undefined ? {} : { runtimeGeneration }),
+          reused,
           networkName,
           runtimeNetworkName,
           ...(volumeName === undefined ? {} : { volumeName }),
@@ -259,6 +289,11 @@ export async function startMiniStack(
     await sleep(config.healthIntervalMs ?? 500);
   }
   throw new Error(`MiniStack did not become ready: ${lastFailure}`);
+}
+
+function hasRuntimeIdentity(containerId: string | undefined, runtimeGeneration: string | undefined): boolean {
+  return containerId !== undefined && containerId.trim().length > 0 &&
+    runtimeGeneration !== undefined && runtimeGeneration.trim().length > 0;
 }
 
 export async function stopMiniStack(
@@ -353,8 +388,9 @@ function lambdaContainerFlags(configured: string | undefined): string {
 }
 
 function parseDockerInspection(value: string): {
+  Id?: string;
   Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
-  State?: { Running?: boolean; ExitCode?: number };
+  State?: { Running?: boolean; ExitCode?: number; StartedAt?: string };
   RepoDigests?: string[];
   HostConfig?: {
     PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
@@ -367,8 +403,9 @@ function parseDockerInspection(value: string): {
     throw new Error("docker inspect returned an unexpected response");
   }
   return parsed[0] as {
+    Id?: string;
     Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
-    State?: { Running?: boolean; ExitCode?: number };
+    State?: { Running?: boolean; ExitCode?: number; StartedAt?: string };
     RepoDigests?: string[];
     HostConfig?: {
       PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;

@@ -419,6 +419,9 @@ Core commands:
 Compatibility:
   anbo sandbox up is an alias for anbo deploy --target ministack
 
+MiniStack deploy options:
+  --reconcile              Force a full Terraform refresh
+
 Global options:
   --target <id>            Select a target
   --root <path>            Select a project root

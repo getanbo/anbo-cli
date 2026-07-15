@@ -103,6 +103,15 @@ artifact is reused rather than rebuilt. Terraform provider plugins, private
 workspaces, Docker BuildKit cache, MiniStack persistence, and clone metadata are
 stored under the CLI-provided namespaced state and cache paths.
 
+A normal deploy skips a Terraform root only when its owned inputs, saved state
+metadata, filtered outputs, and the exact healthy MiniStack container process
+match the last ready deploy. Use `anbo deploy --reconcile` for an explicit drift
+refresh. Every reconciled root still runs init, validation, and plan, but a
+no-change plan never runs apply. When a source lock file exists, the plugin
+privately caches init-augmented provider checksums by project, root, source lock,
+and worker identity; it never modifies the source lock or invents one for a
+lockless project.
+
 Smoke tests are declared in `.anbo/sandbox.json` and execute only through
 `anbo test` or the deploy lifecycle. Tests may emit the `jsonl-v1` protocol;
 the plugin promotes assertions and progress into the canonical ordered event
