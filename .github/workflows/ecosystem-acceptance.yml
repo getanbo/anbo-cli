@@ -70,12 +70,12 @@ jobs:
         run: |
           npm ci --prefix plugin-ministack
           cp plugin-ministack/package.json /tmp/plugin-ministack-package.json
-          npm install --prefix plugin-ministack --save-dev --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          npm install --prefix plugin-ministack --save-dev --package-lock=false --ignore-scripts "$GITHUB_WORKSPACE"/artifacts/getanbo-plugin-sdk-*.tgz
           mv /tmp/plugin-ministack-package.json plugin-ministack/package.json
           npm run build --prefix plugin-ministack
           npm ci --prefix plugin-cloud
           cp plugin-cloud/package.json /tmp/plugin-cloud-package.json
-          npm install --prefix plugin-cloud --save-dev --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          npm install --prefix plugin-cloud --save-dev --package-lock=false --ignore-scripts "$GITHUB_WORKSPACE"/artifacts/getanbo-plugin-sdk-*.tgz
           mv /tmp/plugin-cloud-package.json plugin-cloud/package.json
           npm run build --prefix plugin-cloud
       - name: Pack exact plugin candidates
@@ -89,7 +89,7 @@ jobs:
       - name: Install candidates into an empty prefix
         run: |
           printf '{"name":"anbo-ecosystem-acceptance","private":true}\n' > install/package.json
-          npm install --prefix install --ignore-scripts --no-audit --no-fund artifacts/*.tgz
+          npm install --prefix install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/artifacts/*.tgz
           cp -R plugin-ministack/fixtures/terraform-smoke/. projects/ministack/
       - name: Run only the installed CLI
         run: node cli/scripts/ecosystem-acceptance.mjs
