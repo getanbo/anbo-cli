@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/getanbo/anbo-cli/main/plugins/ministack/schemas/sandbox.v2.schema.json",
+  "title": "Anbo Sandbox Manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project",
+    "terraform",
+    "data",
+    "services",
+    "builds",
+    "tests",
+    "ministack",
+    "network",
+    "adapters"
+  ],
+  "properties": {
+    "$schema": { "type": "string", "minLength": 1 },
+    "schema_version": { "const": 2 },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "terraform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["roots", "variable_files"],
+      "properties": {
+        "roots": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "variable_files": {
+          "description": "Project-relative paths routed to the deepest configured Terraform root containing each file.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "postgres": { "$ref": "#/$defs/clone" },
+        "dynamodb": {
+          "allOf": [
+            { "$ref": "#/$defs/clone" },
+            { "type": "object", "required": ["region"] }
+          ]
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/service" }
+    },
+    "builds": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/build" }
+    },
+    "tests": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/test" }
+    },
+    "ministack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "profile", "persistence"],
+      "properties": {
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?:[^@\\s]+:[^@\\s]+(?:@sha256:[a-f0-9]{64})?|[^@\\s]+@sha256:[a-f0-9]{64})$"
+        },
+        "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "profile": { "const": "full" },
+        "persistence": { "type": "boolean" },
+        "environment": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_hosts", "clone_egress"],
+      "properties": {
+        "allow_hosts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "clone_egress": { "type": "boolean" }
+      }
+    },
+    "adapters": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/adapter" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": { "pattern": "^(?:/|[A-Za-z]:[\\\\/]|(?:\\.\\./)|\\.\\.$)|(?:^|/)\\.\\.(?:/|$)" }
+    },
+    "secretReference": {
+      "type": "string",
+      "pattern": "^(?:env://[A-Za-z_][A-Za-z0-9_]*|exec://.+)$"
+    },
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "secretMap": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/secretReference" }
+    },
+    "stringArray": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "clone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": { "enum": ["anbo-cloud", "external"] },
+        "source": { "$ref": "#/$defs/identifier" },
+        "endpoint": { "$ref": "#/$defs/secretReference" },
+        "credentials": { "$ref": "#/$defs/secretMap" },
+        "region": { "type": "string", "minLength": 1 },
+        "ttl_seconds": { "type": "integer", "minimum": 1 },
+        "retain_on_down": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "provider": { "const": "anbo-cloud" } }, "required": ["provider"] },
+          "then": { "required": ["source"] }
+        },
+        {
+          "if": { "properties": { "provider": { "const": "external" } }, "required": ["provider"] },
+          "then": { "required": ["endpoint"] }
+        }
+      ]
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context"],
+      "anyOf": [{ "required": ["dockerfile"] }, { "required": ["command"] }],
+      "properties": {
+        "context": { "$ref": "#/$defs/relativePath" },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "dockerfile": { "$ref": "#/$defs/relativePath" },
+        "target": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "args": { "$ref": "#/$defs/stringMap" },
+        "command": { "$ref": "#/$defs/command" },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        }
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["container"],
+      "properties": {
+        "container": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "host": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "protocol": { "enum": ["tcp", "udp"] }
+      }
+    },
+    "healthcheck": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "url"],
+          "properties": {
+            "type": { "const": "http" },
+            "url": { "type": "string", "pattern": "^https?://" },
+            "timeout_seconds": { "type": "integer", "minimum": 1 },
+            "interval_seconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "port"],
+          "properties": {
+            "type": { "const": "tcp" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "timeout_seconds": { "type": "integer", "minimum": 1 },
+            "interval_seconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "command"],
+          "properties": {
+            "type": { "const": "command" },
+            "command": { "$ref": "#/$defs/command" },
+            "timeout_seconds": { "type": "integer", "minimum": 1 },
+            "interval_seconds": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["build"], "not": { "required": ["image"] } },
+        { "required": ["image"], "not": { "required": ["build"] } }
+      ],
+      "properties": {
+        "build": { "$ref": "#/$defs/identifier" },
+        "image": { "type": "string", "minLength": 1 },
+        "command": { "$ref": "#/$defs/command" },
+        "working_directory": { "$ref": "#/$defs/relativePath" },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "not": { "pattern": "^(?:postgres|postgresql)://|^(?:AKIA|ASIA)[A-Z0-9]{16}$" }
+          }
+        },
+        "ports": { "type": "array", "items": { "$ref": "#/$defs/port" } },
+        "depends_on": { "$ref": "#/$defs/stringArray" },
+        "healthcheck": { "$ref": "#/$defs/healthcheck" },
+        "dynamodb_plane": { "enum": ["clone", "ministack"] }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "$ref": "#/$defs/command" },
+        "service": { "$ref": "#/$defs/identifier" },
+        "environment": { "$ref": "#/$defs/stringMap" },
+        "depends_on": { "$ref": "#/$defs/stringArray" },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "default": { "type": "boolean" }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable"],
+      "properties": {
+        "executable": { "type": "string", "minLength": 1, "not": { "pattern": "^(?:/|[A-Za-z]:[\\\\/])" } },
+        "protocol": { "const": 2 },
+        "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "args": { "$ref": "#/$defs/stringArray" },
+        "capabilities": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "environment": { "$ref": "#/$defs/secretMap" },
+        "allowed_hosts": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+      }
+    }
+  }
+}

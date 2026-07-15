@@ -1,8 +1,6 @@
 name: Release foundation packages
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -15,7 +13,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: release-foundation-${{ inputs.version || github.ref_name }}
+  group: release-foundation-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -29,11 +27,11 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
-      - run: npm install --global npm@11.5.1
+      - run: npm install --global npm@11.6.2
       - run: npm ci
       - run: npm run check
       - run: node scripts/check-release.mjs
         env:
-          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+          RELEASE_VERSION: ${{ inputs.version }}
       - run: node scripts/publish-if-missing.mjs packages/plugin-sdk
       - run: node scripts/publish-if-missing.mjs packages/plugin-testkit

@@ -1,17 +1,23 @@
 {
-  "name": "anbo-cli-workspace",
+  "name": "anbo-workspace",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "plugins/*"
   ],
   "scripts": {
     "build": "npm run clean && npm run build --workspaces --if-present",
     "clean": "node scripts/clean.mjs",
-    "test": "npm run build && node --test tests/unit/*.test.mjs && node scripts/acceptance.mjs",
+    "test": "npm run test:unit && npm run test:plugins && npm run test:acceptance",
     "test:unit": "npm run build && node --test tests/unit/*.test.mjs",
-    "test:acceptance": "npm run build && node scripts/acceptance.mjs",
-    "typecheck": "tsc -b --pretty false",
+    "test:plugins": "npm run test --workspace @getanbo/plugin-ministack && npm run test:package --workspace @getanbo/plugin-ministack && npm run test:conformance --workspace @getanbo/plugin-ministack && npm run check --workspace @getanbo/plugin-cloud",
+    "test:acceptance": "npm run build && node scripts/acceptance.mjs && node scripts/official-plugins-acceptance.mjs",
+    "test:installed:ministack": "node scripts/official-plugins-acceptance.mjs ministack",
+    "test:installed:cloud": "node scripts/official-plugins-acceptance.mjs cloud",
+    "test:package": "npm pack --dry-run --workspace packages/plugin-sdk && npm pack --dry-run --workspace packages/plugin-testkit && npm pack --dry-run --workspace packages/cli && npm pack --dry-run --workspace plugins/ministack && npm pack --dry-run --workspace plugins/cloud",
+    "typecheck": "tsc -b --pretty false && npm run typecheck --workspace @getanbo/plugin-ministack && npm run typecheck --workspace @getanbo/plugin-cloud",
     "check": "npm run typecheck && npm test",
     "prepack": "npm run build"
   },
@@ -21,6 +27,7 @@
     "typescript": "^5.7.2"
   },
   "engines": {
-    "node": ">=20"
-  }
+    "node": ">=22"
+  },
+  "packageManager": "npm@11.6.2"
 }

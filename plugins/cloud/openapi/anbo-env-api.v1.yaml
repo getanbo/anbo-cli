@@ -1,0 +1,207 @@
+openapi: 3.1.0
+info:
+  title: Anbo Environment API
+  version: 1.0.0
+  description: Versioned client contract consumed by the Anbo Cloud plugin.
+servers:
+  - url: https://app.getanbo.com
+security:
+  - bearerAuth: []
+paths:
+  /version:
+    get:
+      operationId: getVersion
+      security: []
+      responses:
+        "200":
+          description: API compatibility information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+  /source/check:
+    post:
+      operationId: checkSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source]
+              properties:
+                source: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JsonObject" }
+  /envs:
+    post:
+      operationId: createEnvironment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnvironmentManifest" }
+      responses:
+        "202":
+          description: Environment accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnvironmentSummary" }
+  /envs/{env_id}:
+    parameters:
+      - $ref: "#/components/parameters/EnvironmentId"
+    get:
+      operationId: getEnvironment
+      responses:
+        "200":
+          description: Environment status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnvironmentSummary" }
+    delete:
+      operationId: deleteEnvironment
+      responses:
+        "200":
+          description: Environment deletion started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnvironmentSummary" }
+  /envs/{env_id}/sql:
+    parameters:
+      - $ref: "#/components/parameters/EnvironmentId"
+    post:
+      operationId: runSql
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sql]
+              properties:
+                sql: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JsonObject" }
+  /envs/{env_id}/test-runs:
+    parameters:
+      - $ref: "#/components/parameters/EnvironmentId"
+    post:
+      operationId: createTestRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TestRunRequest" }
+      responses:
+        "202":
+          description: Test run accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestRunSummary" }
+  /envs/{env_id}/test-runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/EnvironmentId"
+      - $ref: "#/components/parameters/RunId"
+    get:
+      operationId: getTestRun
+      responses:
+        "200":
+          description: Test run status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestRunSummary" }
+    delete:
+      operationId: cancelTestRun
+      responses:
+        "200":
+          description: Test run canceled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestRunSummary" }
+  /envs/{env_id}/test-runs/{run_id}/logs:
+    parameters:
+      - $ref: "#/components/parameters/EnvironmentId"
+      - $ref: "#/components/parameters/RunId"
+    get:
+      operationId: getTestRunLogs
+      responses:
+        "200": { $ref: "#/components/responses/JsonObject" }
+  /envs/{env_id}/test-runs/{run_id}/report:
+    parameters:
+      - $ref: "#/components/parameters/EnvironmentId"
+      - $ref: "#/components/parameters/RunId"
+    get:
+      operationId: getTestRunReport
+      responses:
+        "200": { $ref: "#/components/responses/JsonObject" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    EnvironmentId:
+      name: env_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^env-[a-z0-9][a-z0-9-]+[a-z0-9]$" }
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 1 }
+  responses:
+    JsonObject:
+      description: JSON response
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
+  schemas:
+    Version:
+      type: object
+      required: [api_level]
+      properties:
+        api_level: { const: anbo.env/v1 }
+        build: { type: string }
+    EnvironmentManifest:
+      type: object
+      required: [apiVersion, kind, metadata, spec]
+      properties:
+        apiVersion: { const: k8s.anbo.dev/v1 }
+        kind: { const: AnboEnvironment }
+        metadata: { type: object, additionalProperties: true }
+        spec: { type: object, additionalProperties: true }
+    EnvironmentSummary:
+      type: object
+      required: [envId, state]
+      properties:
+        envId: { type: string }
+        state: { type: string }
+        previewUrl: { type: string, format: uri }
+        message: { type: string }
+      additionalProperties: true
+    TestRunRequest:
+      type: object
+      required: [type, execution, image, command, shards, timeout_seconds]
+      properties:
+        type: { enum: [migration, smoke, test, ci] }
+        execution: { enum: [cluster_job, external] }
+        image: { type: string }
+        command: { type: array, items: { type: string } }
+        shards: { type: integer, minimum: 1 }
+        timeout_seconds: { type: integer, minimum: 1 }
+        migration_hash: { type: string }
+    TestRunSummary:
+      type: object
+      required: [envId, runId, type, execution, status, image, command, shards, timeout_seconds]
+      properties:
+        envId: { type: string }
+        runId: { type: string }
+        type: { enum: [migration, smoke, test, ci] }
+        execution: { enum: [cluster_job, external] }
+        status: { enum: [Pending, Starting, Running, Passed, Failed, Canceled, TimedOut] }
+        image: { type: string }
+        command: { type: array, items: { type: string } }
+        shards: { type: integer }
+        timeout_seconds: { type: integer }
+      additionalProperties: true

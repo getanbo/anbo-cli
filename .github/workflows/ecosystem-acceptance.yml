@@ -1,24 +1,15 @@
-name: Ecosystem acceptance
+name: Official plugins acceptance
 
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
-    inputs:
-      ministack_ref:
-        description: getanbo/anbo-plugin-ministack git ref
-        required: true
-        default: main
-      cloud_ref:
-        description: getanbo/anbo-plugin-cloud git ref
-        required: true
-        default: main
 
 permissions:
   contents: read
 
 concurrency:
-  group: ecosystem-${{ inputs.ministack_ref || 'main' }}-${{ inputs.cloud_ref || 'main' }}
+  group: official-plugins-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -26,73 +17,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout CLI
+      - name: Checkout exact monorepo candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          path: cli
-      - name: Checkout MiniStack plugin
-        id: ministack-checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: getanbo/anbo-plugin-ministack
-          ref: ${{ inputs.ministack_ref || 'main' }}
-          path: plugin-ministack
-      - name: Checkout Cloud plugin
-        id: cloud-checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: getanbo/anbo-plugin-cloud
-          ref: ${{ inputs.cloud_ref || 'main' }}
-          path: plugin-cloud
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            cli/package-lock.json
-            plugin-ministack/package-lock.json
-            plugin-cloud/package-lock.json
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Build and pack the canonical host
+      - run: npm install --global npm@11.6.2
+      - run: npm ci
+      - run: npm run build
+      - name: Pack exact workspace candidates
         run: |
           mkdir -p artifacts diagnostics install projects/ministack projects/cloud
-          npm ci --prefix cli
-          npm run build --prefix cli
-          npm pack --prefix cli --workspace packages/plugin-sdk --pack-destination "$GITHUB_WORKSPACE/artifacts"
-          npm pack --prefix cli --workspace packages/plugin-testkit --pack-destination "$GITHUB_WORKSPACE/artifacts"
-          npm pack --prefix cli --workspace packages/cli --pack-destination "$GITHUB_WORKSPACE/artifacts"
-      - name: Build plugins against the candidate SDK
-        run: |
-          npm ci --prefix plugin-ministack
-          cp plugin-ministack/package.json /tmp/plugin-ministack-package.json
-          npm install --prefix plugin-ministack --save-dev --package-lock=false --ignore-scripts "$GITHUB_WORKSPACE"/artifacts/getanbo-plugin-sdk-*.tgz
-          mv /tmp/plugin-ministack-package.json plugin-ministack/package.json
-          npm run build --prefix plugin-ministack
-          npm ci --prefix plugin-cloud
-          cp plugin-cloud/package.json /tmp/plugin-cloud-package.json
-          npm install --prefix plugin-cloud --save-dev --package-lock=false --ignore-scripts "$GITHUB_WORKSPACE"/artifacts/getanbo-plugin-sdk-*.tgz
-          mv /tmp/plugin-cloud-package.json plugin-cloud/package.json
-          npm run build --prefix plugin-cloud
-      - name: Pack exact plugin candidates
-        run: |
-          printf '{"cli":"%s","ministack_plugin":"%s","cloud_plugin":"%s"}\n' \
-            "$GITHUB_SHA" \
-            "${{ steps.ministack-checkout.outputs.commit }}" \
-            "${{ steps.cloud-checkout.outputs.commit }}" > diagnostics/candidates.json
-          npm pack ./plugin-ministack --pack-destination "$GITHUB_WORKSPACE/artifacts"
-          npm pack ./plugin-cloud --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --workspace packages/plugin-sdk --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --workspace packages/plugin-testkit --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --workspace packages/cli --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --workspace plugins/ministack --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --workspace plugins/cloud --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          printf '{"monorepo":"%s"}\n' "$GITHUB_SHA" > diagnostics/candidates.json
       - name: Install candidates into an empty prefix
         run: |
-          printf '{"name":"anbo-ecosystem-acceptance","private":true}\n' > install/package.json
+          printf '{"name":"anbo-official-plugins-acceptance","private":true}\n' > install/package.json
           npm install --prefix install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/artifacts/*.tgz
-          cp -R plugin-ministack/fixtures/terraform-smoke/. projects/ministack/
+          cp -R plugins/ministack/fixtures/terraform-smoke/. projects/ministack/
       - name: Run only the installed CLI
-        run: node cli/scripts/ecosystem-acceptance.mjs
+        run: node scripts/ecosystem-acceptance.mjs
         env:
           ANBO_ECOSYSTEM_INSTALL_ROOT: ${{ github.workspace }}/install
           ANBO_ECOSYSTEM_MINISTACK_ROOT: ${{ github.workspace }}/projects/ministack
@@ -102,7 +57,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: ecosystem-jsonl-${{ github.run_id }}
+          name: official-plugins-jsonl-${{ github.run_id }}
           path: diagnostics
           if-no-files-found: warn
           retention-days: 14

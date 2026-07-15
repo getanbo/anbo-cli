@@ -2,7 +2,7 @@
 
 ## Reporting
 
-Do not open public issues for suspected vulnerabilities. Report them through GitHub's private vulnerability reporting for `getanbo/cli`. Include affected versions, reproduction steps, impact, and any suggested remediation.
+Do not open public issues for suspected vulnerabilities. Report them through GitHub's private vulnerability reporting for `getanbo/anbo-cli`. Include affected versions, reproduction steps, impact, and any suggested remediation.
 
 ## Supported Versions
 

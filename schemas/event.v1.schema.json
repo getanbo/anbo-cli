@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/event.v1.schema.json",
+  "$id": "https://raw.githubusercontent.com/getanbo/anbo-cli/main/schemas/event.v1.schema.json",
   "title": "Anbo Run Event v1",
   "type": "object",
   "required": ["apiVersion", "runId", "sequence", "timestamp", "source", "command", "type", "level"],
