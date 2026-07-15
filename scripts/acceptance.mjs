@@ -93,6 +93,19 @@ try {
     assert.equal(commandResult.data.name, "cloud.branch");
     assert.deepEqual(commandResult.data.args, ["list"]);
   }
+  for (const command of ["login", "logout", "auth", "demo"]) {
+    const legacy = await cli([command, "--root", cloudRoot]);
+    const namespaced = await cli(["cloud", command, "--root", cloudRoot]);
+    for (const result of [legacy, namespaced]) {
+      const commandResult = result.events.find((event) => event.type === "command.result");
+      assert.equal(commandResult.data.name, `cloud.${command}`);
+    }
+  }
+  const cloudTestRun = await cli(["cloud", "test-run", "--root", cloudRoot]);
+  assert.equal(
+    cloudTestRun.events.find((event) => event.type === "command.result").data.name,
+    "cloud.test-run",
+  );
 
   process.stdout.write("Installed CLI acceptance passed.\n");
 } finally {

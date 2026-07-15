@@ -1,0 +1,98 @@
+name: Ecosystem acceptance
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      ministack_ref:
+        description: getanbo/anbo-plugin-ministack git ref
+        required: true
+        default: feat/initial-plugin
+      cloud_ref:
+        description: getanbo/anbo-plugin-cloud git ref
+        required: true
+        default: feat/initial-plugin
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecosystem-${{ inputs.ministack_ref || 'feat/initial-plugin' }}-${{ inputs.cloud_ref || 'feat/initial-plugin' }}
+  cancel-in-progress: false
+
+jobs:
+  installed-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout CLI
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: cli
+      - name: Checkout MiniStack plugin
+        id: ministack-checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: getanbo/anbo-plugin-ministack
+          ref: ${{ inputs.ministack_ref || 'feat/initial-plugin' }}
+          path: plugin-ministack
+      - name: Checkout Cloud plugin
+        id: cloud-checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: getanbo/anbo-plugin-cloud
+          ref: ${{ inputs.cloud_ref || 'feat/initial-plugin' }}
+          path: plugin-cloud
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            cli/package-lock.json
+            plugin-ministack/package-lock.json
+            plugin-cloud/package-lock.json
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: Build source packages
+        run: |
+          npm ci --prefix cli
+          npm run build --prefix cli
+          npm ci --prefix plugin-ministack
+          npm run build --prefix plugin-ministack
+          npm ci --prefix plugin-cloud
+          npm run build --prefix plugin-cloud
+      - name: Pack exact candidates
+        run: |
+          mkdir -p artifacts diagnostics install projects/ministack projects/cloud
+          printf '{"cli":"%s","ministack_plugin":"%s","cloud_plugin":"%s"}\n' \
+            "$GITHUB_SHA" \
+            "${{ steps.ministack-checkout.outputs.commit }}" \
+            "${{ steps.cloud-checkout.outputs.commit }}" > diagnostics/candidates.json
+          npm pack --prefix cli --workspace packages/plugin-sdk --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --prefix cli --workspace packages/plugin-testkit --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --prefix cli --workspace packages/cli --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack ./plugin-ministack --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack ./plugin-cloud --pack-destination "$GITHUB_WORKSPACE/artifacts"
+      - name: Install candidates into an empty prefix
+        run: |
+          printf '{"name":"anbo-ecosystem-acceptance","private":true}\n' > install/package.json
+          npm install --prefix install --ignore-scripts --no-audit --no-fund artifacts/*.tgz
+          cp -R plugin-ministack/fixtures/terraform-smoke/. projects/ministack/
+      - name: Run only the installed CLI
+        run: node cli/scripts/ecosystem-acceptance.mjs
+        env:
+          ANBO_ECOSYSTEM_INSTALL_ROOT: ${{ github.workspace }}/install
+          ANBO_ECOSYSTEM_MINISTACK_ROOT: ${{ github.workspace }}/projects/ministack
+          ANBO_ECOSYSTEM_CLOUD_ROOT: ${{ github.workspace }}/projects/cloud
+          ANBO_ECOSYSTEM_DIAGNOSTICS: ${{ github.workspace }}/diagnostics
+      - name: Upload JSONL diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ecosystem-jsonl-${{ github.run_id }}
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 14

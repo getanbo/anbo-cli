@@ -309,18 +309,23 @@ function routePluginCommand(parsed: ParsedCliArgs): {
   passthrough: string[];
 } {
   const aliases: Record<string, string> = {
+    login: "cloud.login",
+    logout: "cloud.logout",
+    auth: "cloud.auth",
+    demo: "cloud.demo",
     branch: "cloud.branch",
     token: "cloud.token",
     sql: "cloud.sql",
     report: "cloud.report",
     "test-status": "cloud.test-status",
+    "test-run": "cloud.test-run",
   };
   if (parsed.command === "cloud") {
     const [subcommand, ...args] = parsed.positionals;
     if (!subcommand || subcommand === "--") {
       throw new UsageError(
         "cloud requires a subcommand.",
-        "Use cloud branch, token, sql, report, or test-status.",
+        "Use cloud login, logout, auth, demo, branch, token, sql, report, test-run, or test-status.",
       );
     }
     const name = aliases[subcommand];

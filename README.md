@@ -50,7 +50,7 @@ anbo cloud branch list
 anbo cloud sql --env-id example --command "select 1"
 ```
 
-The previous `anbo branch`, `anbo token`, `anbo sql`, `anbo report`, and `anbo test-status` forms route to their corresponding `cloud.*` commands.
+The previous `anbo login`, `logout`, `auth`, `demo`, `branch`, `token`, `sql`, `report`, and `test-status` forms route to their corresponding `cloud.*` commands. Top-level `test-run` remains the target lifecycle alias; `anbo cloud test-run` invokes the namespaced Cloud command.
 
 ## Configuration
 
@@ -99,12 +99,16 @@ npm run check
 
 `npm run check` performs type checking, unit tests, and the installed-tarball acceptance sequence, including cold/warm deploys, passthrough commands, structured logs, secret redaction, cancellation, teardown, and both MiniStack and Cloud routing.
 
+The scheduled/dispatchable **Ecosystem acceptance** workflow packs all three repositories at exact refs, installs them together into an empty prefix, runs the real MiniStack and Cloud flows exclusively through `.bin/anbo`, and retains their JSONL diagnostics.
+
 ## Repository Boundaries
 
 - [`getanbo/cli`](https://github.com/getanbo/cli): executable, SDK, event protocol, config, locks, acceptance kit.
 - [`getanbo/anbo-plugin-ministack`](https://github.com/getanbo/anbo-plugin-ministack): local Terraform and MiniStack target.
 - [`getanbo/anbo-plugin-cloud`](https://github.com/getanbo/anbo-plugin-cloud): remote Anbo Cloud target.
 - [`getanbo/anbo-ministack`](https://github.com/getanbo/anbo-ministack): downstream runtime image, not a CLI.
+
+Release promotion is split to avoid a dependency cycle: SDK and testkit first, both plugins next, and the `anbo` package last. See [`docs/releasing.md`](docs/releasing.md).
 
 ## License
 

@@ -1,15 +1,19 @@
-name: Release
+name: Finalize CLI release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact anbo version to publish after both plugins
+        required: true
+        default: 0.2.0
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-cli-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -27,10 +31,12 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: node scripts/check-release.mjs
-      - name: Verify first-party plugin releases
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+      - name: Verify foundation and first-party plugin releases
         run: |
+          npm view @getanbo/plugin-sdk@0.2.0 version
+          npm view @getanbo/plugin-testkit@0.2.0 version
           npm view @getanbo/plugin-ministack@0.1.0 version
           npm view @getanbo/plugin-cloud@0.1.0 version
-      - run: npm publish --workspace packages/plugin-sdk --access public --provenance
-      - run: npm publish --workspace packages/plugin-testkit --access public --provenance
-      - run: npm publish --workspace packages/cli --access public --provenance
+      - run: node scripts/publish-if-missing.mjs packages/cli

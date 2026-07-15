@@ -1,4 +1,15 @@
-const commands = ["cloud.branch", "cloud.token", "cloud.sql", "cloud.report", "cloud.test-status"];
+const commands = [
+  "cloud.login",
+  "cloud.logout",
+  "cloud.auth",
+  "cloud.demo",
+  "cloud.branch",
+  "cloud.token",
+  "cloud.sql",
+  "cloud.report",
+  "cloud.test-run",
+  "cloud.test-status",
+];
 const actions = ["configure", "deploy", "status", "test", "logs", "debug", "down", "capabilities"];
 const descriptor = {
   schema_version: 1,

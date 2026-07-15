@@ -11,7 +11,7 @@
     "id": "cloud",
     "actions": ["configure", "deploy", "status", "test", "logs", "debug", "down", "capabilities"]
   }],
-  "commands": ["cloud.branch", "cloud.token", "cloud.sql", "cloud.report", "cloud.test-status"],
+  "commands": ["cloud.login", "cloud.logout", "cloud.auth", "cloud.demo", "cloud.branch", "cloud.token", "cloud.sql", "cloud.report", "cloud.test-run", "cloud.test-status"],
   "config": { "schema": "./config.schema.json", "schema_version": 1 },
   "capabilities": ["acceptance.cloud"]
 }
