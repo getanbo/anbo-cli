@@ -23,7 +23,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "clean": "rm -rf dist",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test tests/*.test.ts",
@@ -43,6 +43,7 @@
     "@aws-sdk/client-dynamodb": "^3.901.0"
   },
   "devDependencies": {
+    "@getanbo/plugin-sdk": "0.2.0",
     "@types/node": "^24.0.0",
     "openapi-typescript": "^7.9.1",
     "tsx": "^4.20.0",
@@ -51,7 +52,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/getanbo/anbo-plugin-cloud.git"
+    "url": "git+https://github.com/getanbo/anbo-cli.git",
+    "directory": "plugins/cloud"
   },
   "publishConfig": {
     "access": "public",

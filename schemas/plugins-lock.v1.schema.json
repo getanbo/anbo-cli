@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/plugins-lock.v1.schema.json",
+  "$id": "https://raw.githubusercontent.com/getanbo/anbo-cli/main/schemas/plugins-lock.v1.schema.json",
   "title": "Anbo Plugin Lock v1",
   "type": "object",
   "required": ["apiVersion", "plugins"],

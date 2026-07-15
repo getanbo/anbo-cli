@@ -1,18 +1,22 @@
 # Anbo CLI
 
-Anbo is an agent-first CLI for creating reproducible local and remote deployment environments. This repository is the only canonical source of the `anbo` executable. Deployment implementations live in versioned plugins.
+Anbo is an agent-first CLI for creating reproducible local and remote deployment environments. This monorepo is the canonical source of the `anbo` executable, the public plugin contracts, and every first-party target plugin.
 
 ## Install
 
 The first public release is prepared as `anbo@0.2.0`. Until it is published to npm, build and install the package from this repository:
 
 ```sh
-git clone https://github.com/getanbo/cli.git
-cd cli
+git clone https://github.com/getanbo/anbo-cli.git
+cd anbo-cli
 npm ci
 npm run build
-npm pack --workspace packages/cli
-npm install --global ./anbo-0.2.0.tgz
+mkdir -p /tmp/anbo-packages
+npm pack --workspace packages/plugin-sdk --pack-destination /tmp/anbo-packages
+npm pack --workspace packages/cli --pack-destination /tmp/anbo-packages
+npm pack --workspace plugins/ministack --pack-destination /tmp/anbo-packages
+npm pack --workspace plugins/cloud --pack-destination /tmp/anbo-packages
+npm install --global /tmp/anbo-packages/*.tgz
 anbo version
 ```
 
@@ -97,16 +101,18 @@ npm ci
 npm run check
 ```
 
-`npm run check` performs type checking, unit tests, and the installed-tarball acceptance sequence, including cold/warm deploys, passthrough commands, structured logs, secret redaction, cancellation, teardown, and both MiniStack and Cloud routing.
+`npm run check` performs type checking, native package tests, and packed installed-CLI acceptance for both first-party plugins. It includes cold/warm host fixtures, Cloud API workflows, passthrough commands, structured logs, secret redaction, cancellation, and teardown.
 
-The scheduled/dispatchable **Ecosystem acceptance** workflow packs all three repositories at exact refs, installs them together into an empty prefix, runs the real MiniStack and Cloud flows exclusively through `.bin/anbo`, and retains their JSONL diagnostics.
+The scheduled/dispatchable **Official plugins acceptance** workflow packs every candidate workspace at one exact commit, installs them together into an empty prefix, runs the real MiniStack and Cloud flows exclusively through `.bin/anbo`, and retains their JSONL diagnostics.
 
 ## Repository Boundaries
 
-- [`getanbo/cli`](https://github.com/getanbo/cli): executable, SDK, event protocol, config, locks, acceptance kit.
-- [`getanbo/anbo-plugin-ministack`](https://github.com/getanbo/anbo-plugin-ministack): local Terraform and MiniStack target.
-- [`getanbo/anbo-plugin-cloud`](https://github.com/getanbo/anbo-plugin-cloud): remote Anbo Cloud target.
+- [`packages`](packages): executable, SDK, event protocol, config, locks, and acceptance kit.
+- [`plugins/ministack`](plugins/ministack): local Terraform and MiniStack target.
+- [`plugins/cloud`](plugins/cloud): remote Anbo Cloud target.
 - [`getanbo/anbo-ministack`](https://github.com/getanbo/anbo-ministack): downstream runtime image, not a CLI.
+- [`getanbo/anbo-k8s`](https://github.com/getanbo/anbo-k8s): hosted backend and infrastructure consumed by the Cloud plugin.
+- [`getanbo/anbo-example-notes`](https://github.com/getanbo/anbo-example-notes): external reference consumer and full product acceptance flow.
 
 Release promotion is split to avoid a dependency cycle: SDK and testkit first, both plugins next, and the `anbo` package last. See [`docs/releasing.md`](docs/releasing.md).
 

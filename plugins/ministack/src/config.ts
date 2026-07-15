@@ -224,7 +224,7 @@ export function createDefaultManifest(discovery: DiscoveryReport): SandboxManife
     builds[name] = { context: dockerfile.context, dockerfile: relative(dockerfile.context, dockerfile.path) || basename(dockerfile.path) };
   }
   return {
-    $schema: "https://raw.githubusercontent.com/getanbo/anbo-plugin-ministack/v0.1.0/schemas/sandbox.v2.schema.json",
+    $schema: "https://raw.githubusercontent.com/getanbo/anbo-cli/main/plugins/ministack/schemas/sandbox.v2.schema.json",
     schema_version: ANBO_MANIFEST_VERSION,
     project: { name: projectName },
     terraform: {

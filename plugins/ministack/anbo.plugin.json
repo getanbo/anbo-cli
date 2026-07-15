@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/plugin.v1.schema.json",
+  "$schema": "https://raw.githubusercontent.com/getanbo/anbo-cli/main/schemas/plugin.v1.schema.json",
   "schema_version": 1,
   "plugin_api": 1,
   "id": "anbo.ministack",

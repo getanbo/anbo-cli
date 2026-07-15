@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/plugin.v1.schema.json",
+  "$id": "https://raw.githubusercontent.com/getanbo/anbo-cli/main/schemas/plugin.v1.schema.json",
   "title": "Anbo Plugin Descriptor v1",
   "type": "object",
   "required": ["schema_version", "plugin_api", "id", "version", "engines", "targets"],

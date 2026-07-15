@@ -2,7 +2,7 @@
 
 ## Our Standards
 
-We want participation in Anbo Stack to be safe, respectful, and productive.
+We want participation in Anbo CLI to be safe, respectful, and productive.
 Examples of welcome behavior include constructive technical feedback,
 acknowledging tradeoffs, respecting differing experience levels, and taking
 responsibility for mistakes.
@@ -19,7 +19,7 @@ will aim to consider context, impact, and a proportionate response while
 protecting the privacy and safety of people who report concerns.
 
 Report enforcement concerns through the repository's private
-[security-advisory form](https://github.com/getanbo/anbo-plugin-ministack/security/advisories/new)
+[security-advisory form](https://github.com/getanbo/anbo-cli/security/advisories/new)
 and prefix the title with `Conduct:`. Do not use a public issue for a sensitive
 report.
 

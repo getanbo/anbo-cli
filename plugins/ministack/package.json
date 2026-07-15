@@ -37,11 +37,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/getanbo/anbo-plugin-ministack.git"
+    "url": "git+https://github.com/getanbo/anbo-cli.git",
+    "directory": "plugins/ministack"
   },
-  "homepage": "https://github.com/getanbo/anbo-plugin-ministack#readme",
+  "homepage": "https://github.com/getanbo/anbo-cli/tree/main/plugins/ministack#readme",
   "bugs": {
-    "url": "https://github.com/getanbo/anbo-plugin-ministack/issues"
+    "url": "https://github.com/getanbo/anbo-cli/issues"
   },
   "keywords": [
     "anbo",
@@ -69,6 +70,7 @@
     "prepublishOnly": "npm run verify"
   },
   "devDependencies": {
+    "@getanbo/plugin-sdk": "0.2.0",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.2"
   },

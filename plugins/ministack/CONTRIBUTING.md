@@ -8,11 +8,10 @@ You need Node.js 22 or newer. Docker Engine or Docker Desktop is also required
 for the acceptance suite.
 
 ```bash
-git clone https://github.com/getanbo/anbo-plugin-ministack.git
-cd anbo-plugin-ministack
+git clone https://github.com/getanbo/anbo-cli.git
+cd anbo-cli
 npm ci
-# Install the packed @getanbo/plugin-sdk 0.2 artifact supplied by the CLI build.
-npm run verify
+npm run verify --workspace @getanbo/plugin-ministack
 ```
 
 `npm run verify` audits dependencies, type-checks, runs unit tests, validates
@@ -24,7 +23,7 @@ Run the Docker and MiniStack acceptance flow before submitting runtime or
 Terraform changes:
 
 ```bash
-ANBO_CLI_TARBALL=/absolute/path/to/anbo-0.2.0.tgz npm run test:installed-cli
+npm run test:installed:ministack
 ```
 
 End-to-end tests must go through the installed package's CLI. Do not prove an

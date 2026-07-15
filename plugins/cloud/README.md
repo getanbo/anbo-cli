@@ -1,7 +1,7 @@
 # Anbo Cloud plugin
 
 Anbo Cloud is the hosted-environment target for the canonical
-[`anbo`](https://github.com/getanbo/cli) command-line interface. It contains the
+[`anbo`](https://github.com/getanbo/anbo-cli) command-line interface. It contains the
 client behavior previously embedded in the Anbo infrastructure repository.
 
 This package intentionally has no executable. The canonical CLI owns command

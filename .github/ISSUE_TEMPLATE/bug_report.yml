@@ -1,5 +1,5 @@
 name: Bug report
-description: Report reproducible MiniStack target behavior.
+description: Report reproducible Anbo CLI or first-party plugin behavior.
 title: "[Bug]: "
 labels: [bug]
 body:
@@ -7,10 +7,17 @@ body:
     attributes:
       value: Do not include credentials, clone URLs, Terraform state, or unredacted events.
   - type: input
+    id: component
+    attributes:
+      label: Component
+      description: CLI, Plugin SDK, MiniStack plugin, or Cloud plugin.
+    validations:
+      required: true
+  - type: input
     id: versions
     attributes:
       label: Versions
-      description: Anbo CLI, plugin, runtime image digest, Node.js, and Docker versions.
+      description: Anbo, plugin, runtime image digest, Node.js, Terraform, and Docker versions as applicable.
     validations:
       required: true
   - type: textarea
@@ -24,4 +31,4 @@ body:
     id: diagnostics
     attributes:
       label: Redacted JSONL diagnostics
-      description: Include stable diagnostic codes and the relevant redacted events.
+      description: Include stable diagnostic codes and only the relevant redacted events.

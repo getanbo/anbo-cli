@@ -1,0 +1,55 @@
+name: Release first-party plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: First-party plugin to publish
+        required: true
+        type: choice
+        options:
+          - ministack
+          - cloud
+      version:
+        description: Exact plugin version to publish
+        required: true
+        default: 0.1.0
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-plugin-${{ inputs.plugin }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install --global npm@11.6.2
+      - run: npm ci
+      - name: Verify released SDK contract
+        run: npm view @getanbo/plugin-sdk@0.2.0 version
+      - name: Verify MiniStack candidate
+        if: inputs.plugin == 'ministack'
+        run: |
+          npm run verify --workspace @getanbo/plugin-ministack
+          node plugins/ministack/scripts/check-release.mjs
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+      - name: Verify Cloud candidate
+        if: inputs.plugin == 'cloud'
+        run: npm run check --workspace @getanbo/plugin-cloud
+      - name: Verify requested version
+        run: node scripts/check-plugin-version.mjs "${{ inputs.plugin }}"
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+      - run: node scripts/publish-if-missing.mjs "plugins/${{ inputs.plugin }}"

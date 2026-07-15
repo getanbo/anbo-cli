@@ -1,7 +1,7 @@
 # Anbo MiniStack Plugin
 
 `@getanbo/plugin-ministack` adds the `ministack` deployment target to the
-canonical [`anbo`](https://github.com/getanbo/cli) CLI. It discovers Terraform
+canonical [`anbo`](https://github.com/getanbo/anbo-cli) CLI. It discovers Terraform
 without AI, starts a digest-pinned MiniStack runtime, applies isolated AWS
 Terraform, attaches optional PostgreSQL and DynamoDB clones, runs declared
 services and smoke tests, and streams typed events back through the CLI.
