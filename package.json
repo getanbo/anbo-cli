@@ -1,0 +1,59 @@
+{
+  "name": "@getanbo/plugin-cloud",
+  "version": "0.1.0",
+  "description": "Anbo Cloud target plugin for the canonical Anbo CLI.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./descriptor": "./anbo.plugin.json"
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "openapi",
+    "anbo.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build && npm pack --dry-run",
+    "generate:api": "openapi-typescript openapi/anbo-env-api.v1.yaml -o src/generated/anbo-env-api.ts"
+  },
+  "peerDependencies": {
+    "@getanbo/plugin-sdk": ">=0.2.0 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@getanbo/plugin-sdk": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.901.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "openapi-typescript": "^7.9.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getanbo/anbo-plugin-cloud.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

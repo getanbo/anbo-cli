@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "id": "anbo.cloud",
+  "package": "@getanbo/plugin-cloud",
+  "version": "0.1.0",
+  "plugin_api": 1,
+  "entrypoint": "./dist/index.js",
+  "engines": {
+    "anbo": ">=0.2.0 <0.3.0",
+    "node": ">=22"
+  },
+  "kinds": ["target", "auth", "commands"],
+  "targets": [
+    {
+      "id": "cloud",
+      "actions": ["configure", "deploy", "status", "test", "logs", "debug", "down", "capabilities"]
+    }
+  ],
+  "commands": [
+    "cloud.login",
+    "cloud.logout",
+    "cloud.auth",
+    "cloud.demo",
+    "cloud.branch",
+    "cloud.token",
+    "cloud.sql",
+    "cloud.report",
+    "cloud.test-run",
+    "cloud.test-status"
+  ],
+  "config": {
+    "schema": "./schemas/cloud.v1.schema.json",
+    "schema_version": 1
+  },
+  "capabilities": ["anbo.cloud", "postgres.clone", "dynamodb.clone", "remote.tests", "structured.logs"]
+}
