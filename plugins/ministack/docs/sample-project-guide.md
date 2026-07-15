@@ -489,9 +489,22 @@ Deploy after source or Terraform changes:
 anbo deploy --timeout 900 --run-id notes-deploy-002 --output jsonl
 ```
 
-Unchanged command builds, Docker images, and Terraform providers are reused.
-Always confirm the reported cache result rather than inferring it from elapsed
-time.
+Unchanged command builds and Docker images are reused. A normal deploy starts no
+Terraform workers only when the owned inputs, saved state metadata, filtered
+outputs, and exact MiniStack process generation match the last ready deploy.
+Always confirm the reported reconciliation and cache results rather than
+inferring them from elapsed time.
+
+Request an explicit drift refresh when needed:
+
+```bash
+anbo deploy --reconcile --timeout 900 --run-id notes-reconcile-001 --output jsonl
+```
+
+Reconciliation still runs init, validation, and plan, but a no-change plan does
+not run apply. If the project commits `.terraform.lock.hcl`, the plugin keeps a
+private, project-scoped cache of worker-platform checksum augmentation. The
+source lock remains unchanged, and lockless projects do not reuse that cache.
 
 Use these commands instead of dropping below the CLI:
 
@@ -561,8 +574,8 @@ Treat the sample as complete when all of these are true:
   check.
 - `anbo test` verifies a current-run user action and its important side effects.
 - `anbo sandbox up` repeats the full path with one command.
-- A second unchanged deploy reports build cache hits and an expected Terraform
-  plan.
+- A second unchanged deploy reports build cache hits and skips unchanged
+  Terraform roots without starting workers.
 - `logs --follow` carries the active `ANBO_RUN_ID` through application logs.
 - An intentional failure produces a useful `debug` response with no secrets.
 - No test or benchmark invokes Terraform, Docker, or the smoke script outside

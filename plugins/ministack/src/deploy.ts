@@ -1,12 +1,14 @@
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { getCapabilityReport } from "./capabilities.js";
 import { invokeAdapter, type AdapterResponse } from "./adapters.js";
 import type { PluginEventSink } from "./event-sink.js";
 import { spawnStreaming } from "./process.js";
 import {
+  assertSecretFree,
   deriveRuntimeProjectId,
   OperationLockedError,
   ProjectSupervisor,
@@ -46,7 +48,21 @@ import {
   type RunningService,
   type ServiceRuntimeContext,
 } from "./runtime/services.js";
-import { runTerraform, type TerraformRunResult } from "./runtime/terraform.js";
+import {
+  runTerraform,
+  type TerraformChangeSummary,
+  type TerraformLifecycleEvent,
+  type TerraformRunResult,
+} from "./runtime/terraform.js";
+import {
+  TERRAFORM_RECONCILIATION_SCHEMA_VERSION,
+  aggregateTerraformReconciliationFingerprint,
+  stableJson,
+  terraformReconciliationFingerprint,
+  terraformRootStateKey,
+  terraformStateMetadata,
+  type TerraformStateMetadata,
+} from "./runtime/terraform-reconciliation.js";
 import { injectLambdaCloneBindings } from "./runtime/lambda-overlays.js";
 
 interface PersistedRuntimeState extends SupervisorState {
@@ -54,13 +70,20 @@ interface PersistedRuntimeState extends SupervisorState {
   last_run_id?: string;
   ministack?: {
     container_name: string;
+    container_id?: string;
+    runtime_generation?: string;
     network_name: string;
     runtime_network_name?: string;
     host_endpoint: string;
     container_endpoint: string;
     image: string;
   };
-  terraform?: { outputs: Record<string, unknown>; roots: string[] };
+  terraform?: {
+    outputs: Record<string, unknown>;
+    roots: string[];
+    pending_roots?: string[];
+    reconciliation?: PersistedTerraformReconciliation;
+  };
   services?: Record<string, RunningService>;
   clones?: Record<string, unknown>;
   last_failure?: {
@@ -71,8 +94,42 @@ interface PersistedRuntimeState extends SupervisorState {
   };
 }
 
+interface PersistedTerraformRootReconciliation {
+  index: number;
+  root: string;
+  state_key: string;
+  fingerprint: string;
+  state?: TerraformStateMetadata;
+  outputs: Record<string, unknown>;
+}
+
+interface PersistedTerraformReconciliation {
+  schema_version: typeof TERRAFORM_RECONCILIATION_SCHEMA_VERSION;
+  fingerprint: string;
+  runtime_container_id?: string;
+  runtime_generation?: string;
+  roots: PersistedTerraformRootReconciliation[];
+}
+
+interface TerraformRootDecision extends PersistedTerraformRootReconciliation {
+  skipped: boolean;
+  reconciled: boolean;
+  reason: string;
+}
+
+interface TerraformDeployResult extends TerraformRunResult {
+  skipped: boolean;
+  reconciled: boolean;
+  reason: string;
+  fingerprint: string;
+  reconciliation: PersistedTerraformReconciliation;
+  rootDecisions: TerraformRootDecision[];
+}
+
 const defaultCommands = new ProcessCommandExecutor();
 const DEFAULT_TERRAFORM_WORKER = "hashicorp/terraform:1.15.7@sha256:40e61a86763083ea987ded0ffa15f6d75e0df48ed16275811f949b3ecbcd8aae";
+const TERRAFORM_FINGERPRINT_MATCH = "terraform_reconciliation_fingerprint_match";
+const TERRAFORM_RECONCILE_REQUESTED = "terraform_reconcile_requested";
 
 export async function runDeploy(request: DeployRequest, sink: PluginEventSink): Promise<RunSummary> {
   const logicalProjectId = request.manifest.project.id ?? request.manifest.project.name;
@@ -241,7 +298,13 @@ async function deploySandbox(
   reportPhase("terraform");
   const terraformPhase = await sink.startPhase("Terraform deploy", "terraform");
   const terraform = await applyTerraformRoots(request, supervisor, miniStack, signal, sink, cacheHome);
-  await terraformPhase.finish("Terraform applied", { changes: terraform.changes });
+  await terraformPhase.finish(terraform.skipped ? "Terraform unchanged" : "Terraform reconciled", {
+    changes: terraform.changes,
+    skipped: terraform.skipped,
+    reconciled: terraform.reconciled,
+    reason: terraform.reason,
+    roots: terraform.rootDecisions.map(terraformRootDecisionSummary),
+  });
 
   reportPhase("lambda");
   const lambdaPhase = await sink.startPhase("Lambda clone bindings", "ministack.lambda");
@@ -303,7 +366,11 @@ async function deploySandbox(
     status: "ready",
     last_run_id: sink.runId,
     ministack: persistedMiniStack(miniStack),
-    terraform: { outputs: terraform.outputs, roots: [...request.manifest.terraform.roots] },
+    terraform: {
+      outputs: terraform.outputs,
+      roots: [...request.manifest.terraform.roots],
+      reconciliation: terraform.reconciliation,
+    },
     services,
     clones: cloneState?.clones ?? {},
   });
@@ -334,6 +401,12 @@ async function deploySandbox(
       ...(result.image === undefined ? {} : { image: result.image }),
     }])),
     terraform_changes: terraform.changes,
+    terraform_reconciliation: {
+      skipped: terraform.skipped,
+      reconciled: terraform.reconciled,
+      reason: terraform.reason,
+      roots: terraform.rootDecisions.map(terraformRootDecisionSummary),
+    },
     lambda_clone_bindings: lambdaOverlays,
     adapters: safeAdapterSummary(adapters),
     services: Object.keys(services),
@@ -348,7 +421,7 @@ async function applyTerraformRoots(
   signal: AbortSignal,
   sink: PluginEventSink,
   cacheHome: string,
-): Promise<TerraformRunResult> {
+): Promise<TerraformDeployResult> {
   const variableFilesByRoot = routeTerraformVariableFiles(
     request.root,
     request.manifest.terraform.roots,
@@ -359,6 +432,20 @@ async function applyTerraformRoots(
     signal,
     request.commands ?? defaultCommands,
   );
+  const previousState = await supervisor.readState<PersistedRuntimeState>();
+  assertTerraformRootTopologyPreserved(request.root, request.manifest.terraform.roots, previousState);
+  const pendingRoots = [...(previousState?.terraform?.pending_roots ?? [])];
+  const ownedStateKeys = new Set(
+    [...(previousState?.terraform?.roots ?? []), ...pendingRoots]
+      .map((root) => terraformRootStateKey(request.root, root)),
+  );
+  await migrateLegacyTerraformStateDirectories(request.root, supervisor.stateDirectory, previousState);
+  const previousReconciliation = parsePersistedTerraformReconciliation(
+    previousState,
+    request.root,
+    request.manifest.terraform.roots,
+  );
+  const reconcileRequested = request.flags["reconcile"] === true;
   const aggregate: TerraformRunResult = {
     privateDirectory: "",
     planPath: "",
@@ -366,31 +453,461 @@ async function applyTerraformRoots(
     changes: { create: 0, update: 0, delete: 0, replace: 0, noOp: 0 },
     outputs: {},
   };
+  const rootDecisions: TerraformRootDecision[] = [];
   for (let index = 0; index < request.manifest.terraform.roots.length; index += 1) {
     const root = request.manifest.terraform.roots[index];
     if (root === undefined) continue;
+    const sourceDirectory = resolve(request.root, root);
+    const stateKey = terraformRootStateKey(request.root, root);
+    const rootStateDirectory = join(supervisor.stateDirectory, "terraform", "roots", stateKey);
+    const privateDirectory = join(rootStateDirectory, "workspace");
+    const statePath = join(rootStateDirectory, "terraform.tfstate");
+    const variableFiles = variableFilesByRoot.get(root) ?? [];
+    await emitTerraformLifecycle(sink, root, index, { phase: "terraform.fingerprint", status: "started" });
+    const fingerprintStarted = performance.now();
+    let fingerprint: string;
+    try {
+      fingerprint = await terraformReconciliationFingerprint({
+        projectDirectory: request.root,
+        sourceDirectory,
+        excludedPaths: [supervisor.stateDirectory, join(cacheHome, "anbo", "v2")],
+        root,
+        variableFiles,
+        workerImage,
+        stateIdentity: { key: stateKey, filename: basename(statePath) },
+        miniStack: {
+          containerName: miniStack.containerName,
+          ...(miniStack.containerId === undefined ? {} : { containerId: miniStack.containerId }),
+          ...(miniStack.runtimeGeneration === undefined ? {} : { runtimeGeneration: miniStack.runtimeGeneration }),
+          networkName: miniStack.networkName,
+          containerEndpoint: miniStack.containerEndpoint,
+          image: miniStack.image,
+          profile: request.manifest.ministack.profile,
+          persistence: request.manifest.ministack.persistence,
+          ...(request.manifest.ministack.environment === undefined
+            ? {}
+            : { environment: request.manifest.ministack.environment }),
+        },
+        terraform: { region: "us-east-1", accountId: "000000000000" },
+      });
+      await emitTerraformLifecycle(sink, root, index, {
+        phase: "terraform.fingerprint",
+        status: "succeeded",
+        durationMs: Math.max(0, Math.round(performance.now() - fingerprintStarted)),
+      });
+    } catch (cause) {
+      await emitTerraformLifecycle(sink, root, index, {
+        phase: "terraform.fingerprint",
+        status: "failed",
+        durationMs: Math.max(0, Math.round(performance.now() - fingerprintStarted)),
+      });
+      throw cause;
+    }
+    const currentState = await terraformStateMetadata(statePath);
+    const previousRoot = previousReconciliation?.roots[index];
+    const skipReason = terraformSkipReason({
+      request,
+      miniStack,
+      reconcileRequested,
+      previousReconciliation,
+      previousRoot,
+      root,
+      index,
+      fingerprint,
+      currentState,
+    });
+
+    aggregate.privateDirectory = privateDirectory;
+    aggregate.planPath = join(privateDirectory, ".anbo.plan");
+    aggregate.statePath = statePath;
+    if (skipReason === TERRAFORM_FINGERPRINT_MATCH && previousRoot !== undefined && currentState !== undefined) {
+      aggregate.outputs = { ...aggregate.outputs, ...previousRoot.outputs };
+      const decision: TerraformRootDecision = {
+        ...previousRoot,
+        state: currentState,
+        fingerprint,
+        skipped: true,
+        reconciled: false,
+        reason: skipReason,
+      };
+      rootDecisions.push(decision);
+      await emitTerraformRootDecision(sink, decision);
+      continue;
+    }
+
+    if (!ownedStateKeys.has(stateKey)) {
+      pendingRoots.push(root);
+      ownedStateKeys.add(stateKey);
+      await persistPendingTerraformRootOwnership(supervisor, pendingRoots);
+    }
+
     const result = await runTerraform({
-      sourceDirectory: resolve(request.root, root),
-      privateDirectory: join(supervisor.stateDirectory, "terraform", String(index), "workspace"),
-      statePath: join(supervisor.stateDirectory, "terraform", String(index), "terraform.tfstate"),
+      projectDirectory: request.root,
+      sourceDirectory,
+      privateDirectory,
+      statePath,
       pluginCacheDirectory: join(cacheHome, "anbo", "v2", "terraform", "plugins"),
+      lockCacheDirectory: join(cacheHome, "anbo", "v2", "terraform", "locks", supervisor.projectId, stateKey),
+      excludedPaths: [supervisor.stateDirectory, join(cacheHome, "anbo", "v2")],
       workerImage,
       networkName: miniStack.networkName,
       miniStackEndpoint: miniStack.containerEndpoint,
-      variableFiles: variableFilesByRoot.get(root) ?? [],
+      variableFiles,
       environment: request.env,
       signal,
     }, {
       commands: request.commands ?? defaultCommands,
       onOutput: async (stream, text, outputPhase) => { await sink.processOutput({ phase: outputPhase, source: "terraform", stream, chunk: text }); },
+      onLifecycle: async (event) => { await emitTerraformLifecycle(sink, root, index, event); },
     });
     aggregate.privateDirectory = result.privateDirectory;
     aggregate.planPath = result.planPath;
     aggregate.statePath = result.statePath;
     aggregate.outputs = { ...aggregate.outputs, ...result.outputs };
     for (const key of Object.keys(aggregate.changes) as Array<keyof typeof aggregate.changes>) aggregate.changes[key] += result.changes[key];
+    const state = await terraformStateMetadata(statePath);
+    const decision: TerraformRootDecision = {
+      index,
+      root,
+      state_key: stateKey,
+      fingerprint,
+      ...(state === undefined ? {} : { state }),
+      outputs: result.outputs,
+      skipped: false,
+      reconciled: true,
+      reason: skipReason,
+    };
+    rootDecisions.push(decision);
+    await emitTerraformRootDecision(sink, decision);
   }
-  return aggregate;
+  const reconciliationRoots = rootDecisions.map(persistedTerraformRootDecision);
+  const fingerprint = aggregateTerraformReconciliationFingerprint(reconciliationRoots);
+  const skipped = rootDecisions.length > 0 && rootDecisions.every((decision) => decision.skipped);
+  const reconciled = rootDecisions.some((decision) => decision.reconciled);
+  const reason = skipped
+    ? TERRAFORM_FINGERPRINT_MATCH
+    : reconcileRequested
+      ? TERRAFORM_RECONCILE_REQUESTED
+      : commonTerraformDecisionReason(rootDecisions);
+  return {
+    ...aggregate,
+    skipped,
+    reconciled,
+    reason,
+    fingerprint,
+    reconciliation: {
+      schema_version: TERRAFORM_RECONCILIATION_SCHEMA_VERSION,
+      fingerprint,
+      ...(miniStack.containerId === undefined ? {} : { runtime_container_id: miniStack.containerId }),
+      ...(miniStack.runtimeGeneration === undefined ? {} : { runtime_generation: miniStack.runtimeGeneration }),
+      roots: reconciliationRoots,
+    },
+    rootDecisions,
+  };
+}
+
+function assertTerraformRootTopologyPreserved(
+  projectRoot: string,
+  configuredRoots: readonly string[],
+  previousState: PersistedRuntimeState | undefined,
+): void {
+  const currentKeys = new Set<string>();
+  for (const root of configuredRoots) {
+    const key = terraformRootStateKey(projectRoot, root);
+    if (currentKeys.has(key)) throw terraformRootTopologyError("the current Terraform root mapping is ambiguous");
+    currentKeys.add(key);
+  }
+  if (previousState?.terraform === undefined) return;
+  const previousKeys = new Set<string>();
+  for (const [field, roots] of [
+    ["roots", previousState.terraform.roots],
+    ["pending_roots", previousState.terraform.pending_roots ?? []],
+  ] as const) {
+    if (!Array.isArray(roots) || !roots.every((root): root is string => typeof root === "string")) {
+      throw terraformRootTopologyError(`the previous Terraform ${field} mapping is malformed`);
+    }
+    for (const root of roots) {
+      const key = terraformRootStateKey(projectRoot, root);
+      if (previousKeys.has(key)) throw terraformRootTopologyError("the previous Terraform root mapping is ambiguous");
+      previousKeys.add(key);
+      if (!currentKeys.has(key)) {
+        throw terraformRootTopologyError(`previously managed root ${JSON.stringify(root)} is absent from the current configuration`);
+      }
+    }
+  }
+}
+
+async function persistPendingTerraformRootOwnership(
+  supervisor: ProjectSupervisor,
+  pendingRoots: readonly string[],
+): Promise<void> {
+  const current = await supervisor.readState<PersistedRuntimeState>();
+  const terraform = current?.terraform;
+  await supervisor.writeState({
+    ...(current ?? {}),
+    status: current?.status ?? "deploying",
+    terraform: {
+      ...(terraform ?? {}),
+      outputs: terraform?.outputs ?? {},
+      roots: terraform?.roots ?? [],
+      pending_roots: [...pendingRoots],
+    },
+  });
+}
+
+function terraformRootTopologyError(cause: string): Error {
+  return new Error(
+    `Cannot safely change the Terraform root topology because ${cause}. ` +
+    "Run anbo down --purge, then anbo deploy so removed roots cannot leave unmanaged resources behind.",
+  );
+}
+
+function terraformSkipReason(input: {
+  request: DeployRequest;
+  miniStack: MiniStackRuntime;
+  reconcileRequested: boolean;
+  previousReconciliation: PersistedTerraformReconciliation | undefined;
+  previousRoot: PersistedTerraformRootReconciliation | undefined;
+  root: string;
+  index: number;
+  fingerprint: string;
+  currentState: TerraformStateMetadata | undefined;
+}): string {
+  if (input.reconcileRequested) return TERRAFORM_RECONCILE_REQUESTED;
+  if (input.request.action !== "deploy") return "terraform_non_deploy_action";
+  if (!input.miniStack.reused) return "ministack_runtime_not_reused";
+  if (input.miniStack.containerId === undefined) return "ministack_runtime_identity_missing";
+  if (input.miniStack.runtimeGeneration === undefined) return "ministack_runtime_generation_missing";
+  if (input.previousReconciliation === undefined || input.previousRoot === undefined) {
+    return "terraform_reconciliation_metadata_missing";
+  }
+  if (input.previousReconciliation.runtime_container_id !== input.miniStack.containerId) {
+    return "ministack_runtime_identity_changed";
+  }
+  if (input.previousReconciliation.runtime_generation !== input.miniStack.runtimeGeneration) {
+    return "ministack_runtime_generation_changed";
+  }
+  if (input.previousRoot.index !== input.index || input.previousRoot.root !== input.root) {
+    return "terraform_root_identity_changed";
+  }
+  if (input.previousRoot.fingerprint !== input.fingerprint) return "terraform_reconciliation_fingerprint_changed";
+  if (input.previousRoot.state === undefined) return "terraform_state_metadata_missing";
+  if (input.currentState === undefined) return "terraform_state_missing";
+  if (stableJson(input.previousRoot.state) !== stableJson(input.currentState)) return "terraform_state_metadata_changed";
+  return TERRAFORM_FINGERPRINT_MATCH;
+}
+
+async function migrateLegacyTerraformStateDirectories(
+  projectRoot: string,
+  stateDirectory: string,
+  previousState: PersistedRuntimeState | undefined,
+): Promise<void> {
+  const terraformDirectory = join(stateDirectory, "terraform");
+  let entries;
+  try { entries = await readdir(terraformDirectory, { withFileTypes: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const legacy = entries.filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name));
+  if (legacy.length === 0) return;
+  const nonCanonical = legacy.find((entry) => !/^(?:0|[1-9]\d*)$/.test(entry.name) || !Number.isSafeInteger(Number(entry.name)));
+  if (nonCanonical !== undefined) {
+    throw legacyTerraformStateError(`legacy root index ${JSON.stringify(nonCanonical.name)} is not canonical`);
+  }
+  const previousRoots = previousState?.terraform?.roots;
+  if (!Array.isArray(previousRoots) || !previousRoots.every((root): root is string => typeof root === "string")) {
+    throw legacyTerraformStateError("the previous Terraform root mapping is missing");
+  }
+  const stateKeys = new Map<string, number>();
+  for (let index = 0; index < previousRoots.length; index += 1) {
+    const root = previousRoots[index];
+    if (root === undefined) continue;
+    const stateKey = terraformRootStateKey(projectRoot, root);
+    if (stateKeys.has(stateKey)) throw legacyTerraformStateError("the previous Terraform root mapping is ambiguous");
+    stateKeys.set(stateKey, index);
+  }
+  await mkdir(join(terraformDirectory, "roots"), { recursive: true, mode: 0o700 });
+  const moves: Array<{ source: string; destination: string; legacyIndex: number }> = [];
+  const destinations = new Set<string>();
+  for (const entry of legacy.sort((left, right) => Number(left.name) - Number(right.name))) {
+    const legacyIndex = Number(entry.name);
+    const root = previousRoots[legacyIndex];
+    if (root === undefined) throw legacyTerraformStateError(`legacy root index ${legacyIndex} has no trusted mapping`);
+    const destination = join(terraformDirectory, "roots", terraformRootStateKey(projectRoot, root));
+    if (destinations.has(destination)) {
+      throw legacyTerraformStateError(`legacy root index ${legacyIndex} aliases another state directory`);
+    }
+    destinations.add(destination);
+    if (await pathExists(destination)) {
+      throw legacyTerraformStateError(`legacy root index ${legacyIndex} conflicts with an existing stable state directory`);
+    }
+    moves.push({ source: join(terraformDirectory, entry.name), destination, legacyIndex });
+  }
+  const completedMoves: Array<{ source: string; destination: string }> = [];
+  for (const move of moves) {
+    try {
+      await rename(move.source, move.destination);
+      completedMoves.push(move);
+    } catch (cause) {
+      for (const completed of completedMoves.reverse()) {
+        if (await pathExists(completed.destination)) {
+          await rename(completed.destination, completed.source).catch(() => undefined);
+        }
+      }
+      throw cause;
+    }
+  }
+}
+
+function legacyTerraformStateError(cause: string): Error {
+  return new Error(
+    `Cannot safely migrate legacy Terraform state because ${cause}. ` +
+    "Run anbo down --purge, then anbo deploy to create unambiguous state.",
+  );
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try { await lstat(path); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function parsePersistedTerraformReconciliation(
+  state: PersistedRuntimeState | undefined,
+  projectRoot: string,
+  configuredRoots: readonly string[],
+): PersistedTerraformReconciliation | undefined {
+  if (state?.status !== "ready") return undefined;
+  const terraform = state.terraform as unknown;
+  if (!isRecord(terraform) || !isRecord(terraform["outputs"]) || !Array.isArray(terraform["roots"])) return undefined;
+  if (!sameStringArray(terraform["roots"], configuredRoots)) return undefined;
+  const raw = terraform["reconciliation"];
+  if (!isRecord(raw) || raw["schema_version"] !== TERRAFORM_RECONCILIATION_SCHEMA_VERSION) return undefined;
+  if (!isSha256(raw["fingerprint"]) || typeof raw["runtime_container_id"] !== "string" || raw["runtime_container_id"].length === 0 ||
+      typeof raw["runtime_generation"] !== "string" || raw["runtime_generation"].length === 0) {
+    return undefined;
+  }
+  if (state.ministack?.container_id !== raw["runtime_container_id"] ||
+      state.ministack?.runtime_generation !== raw["runtime_generation"] ||
+      !Array.isArray(raw["roots"]) || raw["roots"].length !== configuredRoots.length) {
+    return undefined;
+  }
+  const roots: PersistedTerraformRootReconciliation[] = [];
+  for (let index = 0; index < configuredRoots.length; index += 1) {
+    const entry = raw["roots"][index];
+    const root = configuredRoots[index];
+    if (root === undefined) return undefined;
+    const stateKey = terraformRootStateKey(projectRoot, root);
+    if (!isRecord(entry) || entry["index"] !== index || entry["root"] !== root ||
+        entry["state_key"] !== stateKey || !isSha256(entry["fingerprint"]) || !isRecord(entry["outputs"])) return undefined;
+    const stateMetadata = parseTerraformStateMetadata(entry["state"]);
+    if (entry["state"] !== undefined && stateMetadata === undefined) return undefined;
+    try { assertSecretFree(entry["outputs"]); } catch { return undefined; }
+    roots.push({
+      index,
+      root,
+      state_key: stateKey,
+      fingerprint: entry["fingerprint"],
+      ...(stateMetadata === undefined ? {} : { state: stateMetadata }),
+      outputs: entry["outputs"],
+    });
+  }
+  const fingerprint = aggregateTerraformReconciliationFingerprint(roots);
+  if (fingerprint !== raw["fingerprint"]) return undefined;
+  const outputs = roots.reduce<Record<string, unknown>>((aggregate, root) => ({ ...aggregate, ...root.outputs }), {});
+  if (stableJson(outputs) !== stableJson(terraform["outputs"])) return undefined;
+  return {
+    schema_version: TERRAFORM_RECONCILIATION_SCHEMA_VERSION,
+    fingerprint,
+    runtime_container_id: raw["runtime_container_id"],
+    runtime_generation: raw["runtime_generation"],
+    roots,
+  };
+}
+
+function parseTerraformStateMetadata(value: unknown): TerraformStateMetadata | undefined {
+  if (!isRecord(value) || typeof value["size"] !== "number" || !isSha256(value["sha256"])) return undefined;
+  if (!Number.isSafeInteger(value["size"]) || value["size"] < 0) {
+    return undefined;
+  }
+  return { size: value["size"], sha256: value["sha256"] };
+}
+
+async function emitTerraformLifecycle(
+  sink: PluginEventSink,
+  root: string,
+  index: number,
+  event: TerraformLifecycleEvent,
+): Promise<void> {
+  await sink.emit({
+    kind: "progress",
+    phase: event.phase,
+    source: "terraform",
+    level: event.status === "failed" ? "error" : "info",
+    message: `${event.phase} ${event.status}`,
+    fields: {
+      status: event.status,
+      root,
+      root_index: index,
+      ...(event.durationMs === undefined ? {} : { duration_ms: event.durationMs }),
+      ...(event.exitCode === undefined ? {} : { exit_code: event.exitCode }),
+      ...(event.reason === undefined ? {} : { reason: event.reason }),
+    },
+    redacted: true,
+  });
+}
+
+async function emitTerraformRootDecision(sink: PluginEventSink, decision: TerraformRootDecision): Promise<void> {
+  await sink.emit({
+    kind: "progress",
+    phase: "terraform.reconciliation",
+    source: "terraform",
+    level: "info",
+    message: decision.skipped ? "Terraform root unchanged" : "Terraform root reconciled",
+    fields: { status: "succeeded", ...terraformRootDecisionSummary(decision) },
+    redacted: true,
+  });
+}
+
+function persistedTerraformRootDecision(decision: TerraformRootDecision): PersistedTerraformRootReconciliation {
+  return {
+    index: decision.index,
+    root: decision.root,
+    state_key: decision.state_key,
+    fingerprint: decision.fingerprint,
+    ...(decision.state === undefined ? {} : { state: decision.state }),
+    outputs: decision.outputs,
+  };
+}
+
+function terraformRootDecisionSummary(decision: TerraformRootDecision): Record<string, unknown> {
+  return {
+    root: decision.root,
+    root_index: decision.index,
+    skipped: decision.skipped,
+    reconciled: decision.reconciled,
+    reason: decision.reason,
+  };
+}
+
+function commonTerraformDecisionReason(decisions: readonly TerraformRootDecision[]): string {
+  const reasons = new Set(decisions.filter((decision) => decision.reconciled).map((decision) => decision.reason));
+  return reasons.size === 1 ? [...reasons][0] ?? "terraform_reconciliation_required" : "terraform_reconciliation_required";
+}
+
+function sameStringArray(value: unknown[], expected: readonly string[]): boolean {
+  return value.length === expected.length && value.every((entry, index) => entry === expected[index]);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 async function testExistingSandbox(
@@ -529,6 +1046,7 @@ async function runInSandbox(
 }
 
 async function downSandbox(request: DeployRequest, supervisor: ProjectSupervisor, sink: PluginEventSink, signal: AbortSignal): Promise<RunSummary> {
+  const currentState = await supervisor.readState<PersistedRuntimeState>();
   const purgeClones = request.flags["purge-clones"] === true
     || request.manifest.data.postgres?.retain_on_down === false
     || request.manifest.data.dynamodb?.retain_on_down === false;
@@ -550,7 +1068,11 @@ async function downSandbox(request: DeployRequest, supervisor: ProjectSupervisor
       request.fetch === undefined ? {} : { fetch: request.fetch },
     );
   }
-  await supervisor.writeState({ status: "stopped", last_run_id: sink.runId });
+  await supervisor.writeState({
+    status: "stopped",
+    last_run_id: sink.runId,
+    ...(purgeLocal || currentState?.terraform === undefined ? {} : { terraform: currentState.terraform }),
+  });
   return { action: "down", status: "succeeded", local_state_purged: purgeLocal, clone_purge_requested: purgeClones };
 }
 
@@ -779,6 +1301,8 @@ async function resolveTerraformWorkerImage(
 function persistedMiniStack(runtime: MiniStackRuntime): NonNullable<PersistedRuntimeState["ministack"]> {
   return {
     container_name: runtime.containerName,
+    ...(runtime.containerId === undefined ? {} : { container_id: runtime.containerId }),
+    ...(runtime.runtimeGeneration === undefined ? {} : { runtime_generation: runtime.runtimeGeneration }),
     network_name: runtime.networkName,
     runtime_network_name: runtime.runtimeNetworkName,
     host_endpoint: runtime.hostEndpoint,

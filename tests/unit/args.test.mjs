@@ -23,3 +23,14 @@ test("known boolean flags do not consume a following positional", () => {
   assert.equal(parsed.flags.follow, true);
   assert.deepEqual(parsed.positionals, ["api"]);
 });
+
+test("reconcile is a boolean deploy flag and preserves following positionals", () => {
+  const parsed = parseCliArgs(["deploy", "--reconcile", "smoke"]);
+  assert.equal(parsed.flags.reconcile, true);
+  assert.deepEqual(parsed.positionals, ["smoke"]);
+
+  const alias = parseCliArgs(["sandbox", "up", "--reconcile"]);
+  assert.equal(alias.command, "deploy");
+  assert.equal(alias.target, "ministack");
+  assert.equal(alias.flags.reconcile, true);
+});
