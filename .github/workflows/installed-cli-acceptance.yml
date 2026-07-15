@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: getanbo/cli
-          ref: 230e7cbd0ab964db61c7e70e6db18e674de4a2e1
+          ref: main
           path: cli
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
