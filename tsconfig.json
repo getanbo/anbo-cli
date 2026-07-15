@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/plugin-sdk" },
+    { "path": "./packages/plugin-testkit" },
+    { "path": "./packages/cli" }
+  ]
+}
