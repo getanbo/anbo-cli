@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/project.v1.schema.json",
+  "title": "Anbo Project v1",
+  "type": "object",
+  "required": ["apiVersion", "defaultTarget", "plugins"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "apiVersion": { "const": "anbo.dev/project/v1" },
+    "defaultTarget": { "type": "string", "minLength": 1 },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["package"],
+        "properties": {
+          "package": { "type": "string", "minLength": 1 },
+          "config": { "type": "object" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,35 @@
+{
+  "name": "@getanbo/plugin-testkit",
+  "version": "0.2.0",
+  "description": "Conformance and installed-CLI helpers for Anbo plugins.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getanbo/cli.git",
+    "directory": "packages/plugin-testkit"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@getanbo/plugin-sdk": "0.2.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

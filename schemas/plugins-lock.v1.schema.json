@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/getanbo/cli/main/schemas/plugins-lock.v1.schema.json",
+  "title": "Anbo Plugin Lock v1",
+  "type": "object",
+  "required": ["apiVersion", "plugins"],
+  "properties": {
+    "apiVersion": { "const": "anbo.dev/plugins-lock/v1" },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["package", "version"],
+        "properties": {
+          "package": { "type": "string", "minLength": 1 },
+          "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+          "integrity": { "type": "string", "pattern": "^sha512-" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

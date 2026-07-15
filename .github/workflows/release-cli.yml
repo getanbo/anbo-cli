@@ -1,0 +1,42 @@
+name: Finalize CLI release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact anbo version to publish after both plugins
+        required: true
+        default: 0.2.0
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-cli-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install --global npm@11.5.1
+      - run: npm ci
+      - run: npm run check
+      - run: node scripts/check-release.mjs
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+      - name: Verify foundation and first-party plugin releases
+        run: |
+          npm view @getanbo/plugin-sdk@0.2.0 version
+          npm view @getanbo/plugin-testkit@0.2.0 version
+          npm view @getanbo/plugin-ministack@0.1.0 version
+          npm view @getanbo/plugin-cloud@0.1.0 version
+      - run: node scripts/publish-if-missing.mjs packages/cli

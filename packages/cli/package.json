@@ -1,0 +1,48 @@
+{
+  "name": "anbo",
+  "version": "0.2.0",
+  "description": "Agent-first CLI for reproducible local and remote deployment targets.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://getanbo.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getanbo/cli.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/getanbo/cli/issues"
+  },
+  "bin": {
+    "anbo": "dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b && node scripts/chmod-bin.mjs",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@getanbo/plugin-sdk": "0.2.0",
+    "ajv": "^8.17.1",
+    "semver": "^7.7.2"
+  },
+  "optionalDependencies": {
+    "@getanbo/plugin-cloud": "0.1.0",
+    "@getanbo/plugin-ministack": "0.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

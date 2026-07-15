@@ -1,0 +1,13 @@
+{
+  "name": "@getanbo/plugin-cloud",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    },
+    "./descriptor": "./anbo.plugin.json"
+  },
+  "files": ["index.mjs", "index.d.ts", "anbo.plugin.json", "config.schema.json"]
+}

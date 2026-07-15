@@ -1,0 +1,39 @@
+name: Release foundation packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact SDK/testkit version to publish
+        required: true
+        default: 0.2.0
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-foundation-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install --global npm@11.5.1
+      - run: npm ci
+      - run: npm run check
+      - run: node scripts/check-release.mjs
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+      - run: node scripts/publish-if-missing.mjs packages/plugin-sdk
+      - run: node scripts/publish-if-missing.mjs packages/plugin-testkit
