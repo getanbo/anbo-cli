@@ -46,6 +46,18 @@ npm run generate:api
 npm run check
 ```
 
-End-to-end certification is owned by `getanbo/cli`. It packs all candidate npm
-artifacts, installs them into an empty directory, and invokes only the installed
-`anbo` executable.
+The Cloud repository also certifies its retained behavior through the packed
+canonical host:
+
+```bash
+ANBO_CLI_TARBALL=/path/to/anbo-0.2.0.tgz \
+ANBO_PLUGIN_SDK_TARBALL=/path/to/getanbo-plugin-sdk-0.2.0.tgz \
+npm run test:installed-cli
+```
+
+This acceptance suite packs the Cloud plugin, installs every candidate into an
+empty prefix, starts a local mock Env API, and invokes only the installed
+`node_modules/.bin/anbo` executable. It covers configuration, deployment and
+polling, remote tests and diagnostics, teardown, and PostgreSQL and DynamoDB
+branch cloning. Direct plugin entrypoints are deliberately outside this test
+boundary.
