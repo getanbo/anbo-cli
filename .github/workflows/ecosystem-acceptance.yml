@@ -8,17 +8,17 @@ on:
       ministack_ref:
         description: getanbo/anbo-plugin-ministack git ref
         required: true
-        default: feat/initial-plugin
+        default: main
       cloud_ref:
         description: getanbo/anbo-plugin-cloud git ref
         required: true
-        default: feat/initial-plugin
+        default: main
 
 permissions:
   contents: read
 
 concurrency:
-  group: ecosystem-${{ inputs.ministack_ref || 'feat/initial-plugin' }}-${{ inputs.cloud_ref || 'feat/initial-plugin' }}
+  group: ecosystem-${{ inputs.ministack_ref || 'main' }}-${{ inputs.cloud_ref || 'main' }}
   cancel-in-progress: false
 
 jobs:
@@ -35,14 +35,14 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: getanbo/anbo-plugin-ministack
-          ref: ${{ inputs.ministack_ref || 'feat/initial-plugin' }}
+          ref: ${{ inputs.ministack_ref || 'main' }}
           path: plugin-ministack
       - name: Checkout Cloud plugin
         id: cloud-checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: getanbo/anbo-plugin-cloud
-          ref: ${{ inputs.cloud_ref || 'feat/initial-plugin' }}
+          ref: ${{ inputs.cloud_ref || 'main' }}
           path: plugin-cloud
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
