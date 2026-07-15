@@ -67,10 +67,14 @@ jobs:
       - name: Build plugins against the candidate SDK
         run: |
           npm ci --prefix plugin-ministack
-          npm install --prefix plugin-ministack --no-save --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          cp plugin-ministack/package.json /tmp/plugin-ministack-package.json
+          npm install --prefix plugin-ministack --save-dev --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          mv /tmp/plugin-ministack-package.json plugin-ministack/package.json
           npm run build --prefix plugin-ministack
           npm ci --prefix plugin-cloud
-          npm install --prefix plugin-cloud --no-save --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          cp plugin-cloud/package.json /tmp/plugin-cloud-package.json
+          npm install --prefix plugin-cloud --save-dev --package-lock=false --ignore-scripts artifacts/getanbo-plugin-sdk-*.tgz
+          mv /tmp/plugin-cloud-package.json plugin-cloud/package.json
           npm run build --prefix plugin-cloud
       - name: Pack exact plugin candidates
         run: |
