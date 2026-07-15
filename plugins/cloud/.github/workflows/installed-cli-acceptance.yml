@@ -1,0 +1,59 @@
+name: Installed CLI acceptance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installed-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Cloud plugin
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout canonical CLI candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: getanbo/cli
+          ref: main
+          path: cli
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            cli/package-lock.json
+      - name: Pack canonical CLI candidates
+        run: |
+          mkdir -p artifacts diagnostics
+          npm ci --prefix cli
+          npm run build --prefix cli
+          npm pack --prefix cli --workspace packages/plugin-sdk --pack-destination "$GITHUB_WORKSPACE/artifacts"
+          npm pack --prefix cli --workspace packages/cli --pack-destination "$GITHUB_WORKSPACE/artifacts"
+      - name: Build Cloud plugin against the candidate SDK
+        run: |
+          npm ci
+          cp package.json /tmp/anbo-plugin-cloud-package.json
+          npm install --save-dev --package-lock=false --ignore-scripts "$GITHUB_WORKSPACE"/artifacts/getanbo-plugin-sdk-*.tgz
+          mv /tmp/anbo-plugin-cloud-package.json package.json
+          npm run check
+      - name: Exercise only the packed, installed CLI
+        run: npm run test:installed-cli
+        env:
+          ANBO_CLI_TARBALL: ${{ github.workspace }}/artifacts/anbo-0.2.0.tgz
+          ANBO_PLUGIN_SDK_TARBALL: ${{ github.workspace }}/artifacts/getanbo-plugin-sdk-0.2.0.tgz
+          ANBO_ACCEPTANCE_DIAGNOSTICS: ${{ github.workspace }}/diagnostics
+      - name: Upload JSONL diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cloud-installed-cli-${{ github.run_id }}
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 14

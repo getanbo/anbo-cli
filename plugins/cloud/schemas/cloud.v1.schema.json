@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.getanbo.com/plugins/cloud/v1.json",
+  "title": "Anbo Cloud plugin configuration",
+  "type": "object",
+  "required": ["version", "apiUrl", "project"],
+  "properties": {
+    "version": { "const": 1 },
+    "mode": { "enum": ["env_api", "preview", "demo"] },
+    "apiUrl": { "type": "string", "format": "uri" },
+    "project": { "type": "string", "minLength": 1 },
+    "routeBaseUrl": { "type": "string", "format": "uri" },
+    "repo": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "remoteUrl": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "defaults": { "type": "object" },
+    "s3": { "type": "object" },
+    "sources": { "type": "array" },
+    "databaseLinks": { "type": "object" }
+  },
+  "additionalProperties": true
+}
