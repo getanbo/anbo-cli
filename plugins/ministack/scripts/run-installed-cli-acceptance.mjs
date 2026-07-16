@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { access, cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, cp, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -79,6 +80,17 @@ try {
       const arm64Runtime = first.includes('"server_platform":"linux/arm64"');
       if (arm64Runtime) assert.match(first, /"phase":"ministack.compatibility"/);
       else assert.doesNotMatch(first, /"phase":"ministack.compatibility"/);
+      const runtimeId = createHash("sha256").update(await realpath(project)).digest("hex").slice(0, 12);
+      const inspected = spawnSync("docker", [
+        "inspect",
+        "--format", "{{json .Config.Env}}",
+        `anbo-${runtimeId}-ministack`,
+      ], { encoding: "utf8" });
+      assert.equal(inspected.status, 0, inspected.stderr || inspected.stdout);
+      const containerEnvironment = JSON.parse(inspected.stdout);
+      assert.ok(Array.isArray(containerEnvironment));
+      if (arm64Runtime) assert.ok(containerEnvironment.includes("OPENSSL_armcap=0"));
+      else assert.equal(containerEnvironment.includes("OPENSSL_armcap=0"), false);
       assert.match(first, /"name":"kms.generate-data-key"/);
       assert.match(first, /"name":"kms.encrypt-decrypt"/);
       assert.match(second, /"cache_hit":true/);
