@@ -44,7 +44,7 @@
   },
   "devDependencies": {
     "@getanbo/plugin-sdk": "0.2.0",
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.1.1",
     "openapi-typescript": "^7.9.1",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
