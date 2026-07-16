@@ -32,7 +32,14 @@ const manifest: SandboxManifest = {
 class BlockingExecutor implements CommandExecutor {
   async run(_command: string, _args: readonly string[], options?: RuntimeCommandOptions): Promise<RuntimeCommandResult> {
     return await new Promise<RuntimeCommandResult>((_resolve, reject) => {
-      const rejectCancellation = () => reject(options?.signal?.reason ?? new Error("cancelled"));
+      const timeout = setTimeout(() => {
+        options?.signal?.removeEventListener("abort", rejectCancellation);
+        reject(new Error("executor was not cancelled within 5 seconds"));
+      }, 5_000);
+      const rejectCancellation = () => {
+        clearTimeout(timeout);
+        reject(options?.signal?.reason ?? new Error("cancelled"));
+      };
       if (options?.signal?.aborted === true) {
         rejectCancellation();
         return;
