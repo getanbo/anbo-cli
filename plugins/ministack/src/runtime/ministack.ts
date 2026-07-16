@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:net";
 
 import {
+  CERTIFIED_MINISTACK_COMPATIBILITY,
   CERTIFIED_MINISTACK_DIGEST,
   CERTIFIED_MINISTACK_IMAGE,
-  CERTIFIED_MINISTACK_PLATFORM,
+  CERTIFIED_MINISTACK_PLATFORMS,
+  type CertifiedMiniStackPlatform,
 } from "../distribution.js";
 import { Redactor } from "../redaction.js";
 
@@ -83,7 +85,6 @@ export interface MiniStackRuntimeConfig {
   dockerSocket?: string;
   healthTimeoutMs?: number;
   healthIntervalMs?: number;
-  platform?: string;
 }
 
 export interface MiniStackRuntime {
@@ -102,11 +103,20 @@ export interface MiniStackRuntime {
   hostEndpoint: string;
   containerEndpoint: string;
   image: string;
-  /** Platform selected for the certified runtime image. */
-  platform: string;
-  /** Platform reported by the Docker server, when platform selection required discovery. */
-  serverPlatform?: string;
+  /** Native Docker server platform selected from the pinned image index. */
+  platform: CertifiedMiniStackPlatform;
+  /** Platform reported by the Docker server. */
+  serverPlatform: CertifiedMiniStackPlatform;
+  /** Deterministic platform workaround and certification result, when required. */
+  compatibility?: MiniStackCompatibilityMetadata;
   edition: "full";
+}
+
+export interface MiniStackCompatibilityMetadata {
+  id: string;
+  fingerprint: `sha256:${string}`;
+  certification: string;
+  certificationCacheHit: boolean;
 }
 
 export interface MiniStackDependencies {
@@ -116,10 +126,15 @@ export interface MiniStackDependencies {
   now?: () => number;
   signal?: AbortSignal;
   redact?: (text: string) => string;
+  onCompatibility?: (metadata: MiniStackCompatibilityMetadata) => void | Promise<void>;
 }
 
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/i;
 const RUNTIME_CONFIG_LABEL = "anbo.dev/runtime-config";
+const COMPATIBILITY_LABEL = "anbo.dev/ministack-compatibility";
+const CERTIFICATION_IMAGE_REPOSITORY = "anbo/ministack-certification";
+
+class MiniStackCompatibilityCertificationError extends Error {}
 
 export function safeProjectId(value: string): string {
   const normalized = value.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -159,13 +174,9 @@ export async function startMiniStack(
   const redact = dependencies.redact ?? ((text: string) => defaultRedactor.redactString(text));
   const projectId = safeProjectId(config.projectId);
   const image = resolveMiniStackImage(config.image, config.digest);
-  const discoveredServerPlatform = config.platform === undefined
-    ? await dockerServerPlatform(commands, dependencies.signal)
-    : undefined;
-  const platform = config.platform ?? (isCertifiedMiniStackImage(image)
-    ? CERTIFIED_MINISTACK_PLATFORM
-    : discoveredServerPlatform);
-  if (platform === undefined) throw new Error("could not select a MiniStack container platform");
+  const serverPlatform = await dockerServerPlatform(commands, dependencies.signal);
+  const platform = selectMiniStackPlatform(image, serverPlatform);
+  const compatibility = selectedCompatibility(image, platform);
   const containerName = `anbo-${projectId}-ministack`;
   const networkName = `anbo-${projectId}-control`;
   const runtimeNetworkName = `anbo-${projectId}-runtime`;
@@ -181,6 +192,7 @@ export async function startMiniStack(
     runtimeNetworkName,
     volumeName,
     lambdaDockerFlags,
+    compatibility,
   });
   let hostPort: number | undefined;
   let containerId: string | undefined;
@@ -231,6 +243,7 @@ export async function startMiniStack(
       "run", "--detach", "--name", containerName,
       "--platform", platform,
       "--label", "anbo.dev/managed=true", "--label", label, "--label", "anbo.dev/component=ministack",
+      ...(compatibility === undefined ? [] : ["--label", `${COMPATIBILITY_LABEL}=${compatibility.fingerprint}`]),
       "--label", `${RUNTIME_CONFIG_LABEL}=${runtimeConfigFingerprint}`,
       "--network", runtimeNetworkName,
       "--add-host", "host.docker.internal:host-gateway",
@@ -241,6 +254,7 @@ export async function startMiniStack(
       "--env", `LAMBDA_DOCKER_FLAGS=${lambdaDockerFlags}`,
       "--env", `MINISTACK_REGION=${config.region ?? "us-east-1"}`,
       "--env", `MINISTACK_ACCOUNT_ID=${config.accountId ?? "000000000000"}`,
+      ...environmentArguments(compatibility?.environment),
       ...(config.persistence
         ? [
             "--volume", `${volumeName ?? ""}:/var/lib/anbo/ministack`,
@@ -251,7 +265,12 @@ export async function startMiniStack(
             "--env", "RDS_PERSIST=1",
           ]
         : []),
-      ...environmentArguments(config.environment, new Set(["LAMBDA_DOCKER_FLAGS"])),
+      ...environmentArguments(config.environment, new Set([
+        "LAMBDA_DOCKER_FLAGS",
+        ...(isCertifiedMiniStackImage(image)
+          ? Object.values(CERTIFIED_MINISTACK_COMPATIBILITY).flatMap((recipe) => Object.keys(recipe.environment))
+          : []),
+      ])),
       image,
     ];
     const created = await checked(commands, "docker", args, signalOptions(dependencies.signal));
@@ -286,6 +305,44 @@ export async function startMiniStack(
         }
         containerId = healthyInspection.Id ?? containerId;
         runtimeGeneration = healthyInspection.State.StartedAt;
+        let compatibilityMetadata: MiniStackCompatibilityMetadata | undefined;
+        if (compatibility !== undefined) {
+          const runtimeImageId = healthyInspection.Image;
+          if (runtimeImageId === undefined || !DIGEST_PATTERN.test(runtimeImageId)) {
+            throw new MiniStackCompatibilityCertificationError(
+              "MiniStack ARM64 compatibility certification could not identify the running image",
+            );
+          }
+          let certificationCacheHit: boolean;
+          try {
+            certificationCacheHit = await certifyArm64Compatibility({
+              commands,
+              containerName,
+              image,
+              runtimeImageId,
+              compatibility,
+              signal: dependencies.signal,
+              redact,
+            });
+          } catch (error) {
+            throw new MiniStackCompatibilityCertificationError(
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          compatibilityMetadata = {
+            id: compatibility.id,
+            fingerprint: compatibility.fingerprint,
+            certification: compatibility.certification,
+            certificationCacheHit,
+          };
+          try {
+            await dependencies.onCompatibility?.(compatibilityMetadata);
+          } catch (error) {
+            throw new MiniStackCompatibilityCertificationError(
+              `MiniStack ARM64 compatibility event failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         return {
           containerName,
           ...(containerId === undefined ? {} : { containerId }),
@@ -298,7 +355,8 @@ export async function startMiniStack(
           containerEndpoint: `http://${containerName}:4566`,
           image,
           platform,
-          ...(discoveredServerPlatform === undefined ? {} : { serverPlatform: discoveredServerPlatform }),
+          serverPlatform,
+          ...(compatibilityMetadata === undefined ? {} : { compatibility: compatibilityMetadata }),
           edition: "full",
         };
       }
@@ -307,6 +365,7 @@ export async function startMiniStack(
         : `health endpoint returned HTTP ${response.status}`;
     } catch (error) {
       rethrowIfAborted(dependencies.signal, error);
+      if (error instanceof MiniStackCompatibilityCertificationError) throw error;
       lastFailure = error instanceof Error ? error.message : String(error);
     }
     const stopped = await stoppedContainerEvidence(
@@ -315,7 +374,7 @@ export async function startMiniStack(
       dependencies.signal,
       redact,
       platform,
-      discoveredServerPlatform,
+      serverPlatform,
     );
     if (stopped !== undefined) throw new Error(stopped);
     await abortableSleep(config.healthIntervalMs ?? 500, sleep, dependencies.signal);
@@ -350,7 +409,163 @@ function isCertifiedMiniStackImage(image: string): boolean {
   return image.toLowerCase() === CERTIFIED_MINISTACK_IMAGE.toLowerCase();
 }
 
-async function dockerServerPlatform(commands: CommandExecutor, signal?: AbortSignal): Promise<string> {
+interface SelectedMiniStackCompatibility {
+  id: string;
+  environment: Readonly<Record<string, string>>;
+  certification: string;
+  fingerprint: `sha256:${string}`;
+  certificationImage: string;
+}
+
+function selectedCompatibility(
+  image: string,
+  platform: CertifiedMiniStackPlatform,
+): SelectedMiniStackCompatibility | undefined {
+  if (!isCertifiedMiniStackImage(image)) return undefined;
+  const recipe = CERTIFIED_MINISTACK_COMPATIBILITY[platform];
+  if (recipe === undefined) return undefined;
+  const environment = Object.fromEntries(
+    Object.entries(recipe.environment).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  const fingerprint = `sha256:${createHash("sha256").update(JSON.stringify({
+    version: 1,
+    image,
+    platform,
+    id: recipe.id,
+    environment,
+    certification: recipe.certification,
+  })).digest("hex")}` as const;
+  return {
+    id: recipe.id,
+    environment,
+    certification: recipe.certification,
+    fingerprint,
+    certificationImage: `${CERTIFICATION_IMAGE_REPOSITORY}:${fingerprint.slice("sha256:".length)}`,
+  };
+}
+
+const ARM64_CERTIFICATION_SCRIPT = [
+  "import json, platform",
+  "import asyncssh, boto3",
+  "from cryptography.hazmat.primitives.asymmetric import ed25519",
+  "architecture = platform.machine().lower()",
+  "assert architecture in ('aarch64', 'arm64'), architecture",
+  "message = b'anbo-ministack-arm64-certification'",
+  "private_key = ed25519.Ed25519PrivateKey.generate()",
+  "private_key.public_key().verify(private_key.sign(message), message)",
+  "kms = boto3.client('kms', endpoint_url='http://127.0.0.1:4566', region_name='us-east-1', aws_access_key_id='999999999997', aws_secret_access_key='test')",
+  "key_id = kms.create_key(KeyUsage='ENCRYPT_DECRYPT')['KeyMetadata']['KeyId']",
+  "data_key = kms.generate_data_key(KeyId=key_id, KeySpec='AES_256')",
+  "assert len(data_key['Plaintext']) == 32 and len(data_key['CiphertextBlob']) > 0",
+  "ciphertext = kms.encrypt(KeyId=key_id, Plaintext=message)['CiphertextBlob']",
+  "assert kms.decrypt(CiphertextBlob=ciphertext)['Plaintext'] == message",
+  "kms.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)",
+  "print(json.dumps({'architecture': architecture, 'asyncssh': asyncssh.__version__, 'ed25519': True, 'kms': True}, sort_keys=True))",
+].join("; ");
+
+async function certifyArm64Compatibility(options: {
+  commands: CommandExecutor;
+  containerName: string;
+  image: string;
+  runtimeImageId: string;
+  compatibility: SelectedMiniStackCompatibility;
+  signal: AbortSignal | undefined;
+  redact: (text: string) => string;
+}): Promise<boolean> {
+  const cached = await options.commands.run(
+    "docker",
+    ["image", "inspect", "--format", "{{.Id}}", options.compatibility.certificationImage],
+    signalOptions(options.signal),
+  );
+  if (cached.code === 0 && cached.stdout.trim() === options.runtimeImageId) return true;
+  if (cached.code === 0) {
+    await checked(
+      options.commands,
+      "docker",
+      ["image", "rm", "--force", options.compatibility.certificationImage],
+      signalOptions(options.signal),
+    );
+  } else {
+    const detail = cached.stderr.trim() || cached.stdout.trim() || `exit code ${cached.code}`;
+    if (!/(?:no such|not found)/i.test(detail)) {
+      throw new Error(`could not inspect the MiniStack ARM64 certification cache: ${options.redact(detail)}`);
+    }
+  }
+
+  const probe = await options.commands.run(
+    "docker",
+    ["exec", options.containerName, "python", "-c", ARM64_CERTIFICATION_SCRIPT],
+    signalOptions(options.signal),
+  );
+  if (probe.code !== 0) {
+    const detail = probe.stderr.trim() || probe.stdout.trim() || `exit code ${probe.code}`;
+    throw new Error(
+      `MiniStack ARM64 compatibility certification failed: ${boundedTail(options.redact(detail), 8_192)}`,
+    );
+  }
+  const line = probe.stdout.trim().split("\n").filter(Boolean).at(-1);
+  let result: Record<string, unknown>;
+  try {
+    result = JSON.parse(line ?? "") as Record<string, unknown>;
+  } catch {
+    throw new Error("MiniStack ARM64 compatibility certification returned malformed evidence");
+  }
+  if ((result["architecture"] !== "aarch64" && result["architecture"] !== "arm64") ||
+      typeof result["asyncssh"] !== "string" || result["ed25519"] !== true || result["kms"] !== true) {
+    throw new Error("MiniStack ARM64 compatibility certification returned incomplete evidence");
+  }
+
+  await checked(
+    options.commands,
+    "docker",
+    ["image", "tag", options.image, options.compatibility.certificationImage],
+    signalOptions(options.signal),
+  );
+  const tagged = await checked(
+    options.commands,
+    "docker",
+    ["image", "inspect", "--format", "{{.Id}}", options.compatibility.certificationImage],
+    signalOptions(options.signal),
+  );
+  if (tagged.stdout.trim() !== options.runtimeImageId) {
+    await cleanupDocker(
+      options.commands,
+      ["image", "rm", "--force", options.compatibility.certificationImage],
+      options.signal,
+      true,
+    );
+    throw new Error("MiniStack ARM64 compatibility certification cache did not preserve the pinned image identity");
+  }
+  return false;
+}
+
+export async function pruneMiniStackCertification(
+  commands: CommandExecutor = new ProcessCommandExecutor(),
+  signal?: AbortSignal,
+): Promise<void> {
+  const compatibility = selectedCompatibility(CERTIFIED_MINISTACK_IMAGE, "linux/arm64");
+  if (compatibility === undefined) return;
+  await cleanupDocker(commands, ["image", "rm", "--force", compatibility.certificationImage], signal, true);
+}
+
+function selectMiniStackPlatform(
+  image: string,
+  serverPlatform: CertifiedMiniStackPlatform,
+): CertifiedMiniStackPlatform {
+  if (!isCertifiedMiniStackImage(image)) return serverPlatform;
+  if (!CERTIFIED_MINISTACK_PLATFORMS.includes(serverPlatform)) {
+    throw new Error(
+      `The pinned MiniStack image index does not certify Docker server platform ${serverPlatform}; ` +
+      `certified platforms: ${CERTIFIED_MINISTACK_PLATFORMS.join(", ")}`,
+    );
+  }
+  return serverPlatform;
+}
+
+async function dockerServerPlatform(
+  commands: CommandExecutor,
+  signal?: AbortSignal,
+): Promise<CertifiedMiniStackPlatform> {
   const result = await commands.run(
     "docker",
     ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"],
@@ -366,8 +581,15 @@ async function dockerServerPlatform(commands: CommandExecutor, signal?: AbortSig
     "linux/aarch64": "linux/arm64",
   };
   const normalized = aliases[reported] ?? reported;
-  if (!/^linux\/(?:amd64|arm64)$/.test(normalized)) {
-    throw new Error(`Docker server reported unsupported platform ${reported || "<empty>"}; MiniStack requires a Linux container server`);
+  if (!reported || reported.split("/").length !== 2) {
+    throw new Error(
+      `Docker server reported malformed platform ${reported || "<empty>"}; expected os/architecture`,
+    );
+  }
+  if (normalized !== "linux/amd64" && normalized !== "linux/arm64") {
+    throw new Error(
+      `Docker server reported unsupported platform ${reported}; MiniStack requires linux/amd64 or linux/arm64`,
+    );
   }
   return normalized;
 }
@@ -377,8 +599,8 @@ async function stoppedContainerEvidence(
   containerName: string,
   signal: AbortSignal | undefined,
   redact: (text: string) => string,
-  selectedPlatform: string,
-  serverPlatform: string | undefined,
+  selectedPlatform: CertifiedMiniStackPlatform,
+  serverPlatform: CertifiedMiniStackPlatform,
 ): Promise<string | undefined> {
   const inspection = await commands.run("docker", ["inspect", containerName], signalOptions(signal));
   if (inspection.code !== 0) {
@@ -398,7 +620,7 @@ async function stoppedContainerEvidence(
   const stateError = inspected.State.Error?.trim();
   return [
     `MiniStack container exited before becoming ready (exit code ${exitCode}).`,
-    `Container platform: selected=${selectedPlatform}, docker_server=${serverPlatform ?? "not queried (explicit override)"}.`,
+    `Container platform: selected=${selectedPlatform}, docker_server=${serverPlatform}.`,
     ...(stateError === undefined || stateError.length === 0 ? [] : [`Docker state: ${redact(stateError)}`]),
     `Recent container logs:\n${evidence}`,
   ].join("\n");
@@ -507,6 +729,7 @@ function lambdaContainerFlags(configured: string | undefined): string {
 
 function parseDockerInspection(value: string): {
   Id?: string;
+  Image?: string;
   Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
   State?: { Running?: boolean; ExitCode?: number; StartedAt?: string; Error?: string };
   RepoDigests?: string[];
@@ -522,6 +745,7 @@ function parseDockerInspection(value: string): {
   }
   return parsed[0] as {
     Id?: string;
+    Image?: string;
     Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
     State?: { Running?: boolean; ExitCode?: number; StartedAt?: string; Error?: string };
     RepoDigests?: string[];
@@ -587,6 +811,7 @@ function miniStackRuntimeConfigFingerprint(options: {
   runtimeNetworkName: string;
   volumeName: string | undefined;
   lambdaDockerFlags: string;
+  compatibility: SelectedMiniStackCompatibility | undefined;
 }): string {
   const effectiveEnvironment: Record<string, string> = {
     DOCKER_NETWORK: options.runtimeNetworkName,
@@ -594,6 +819,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     LAMBDA_DOCKER_FLAGS: options.lambdaDockerFlags,
     MINISTACK_REGION: options.config.region ?? "us-east-1",
     MINISTACK_ACCOUNT_ID: options.config.accountId ?? "000000000000",
+    ...(options.compatibility?.environment ?? {}),
     ...(options.config.persistence
       ? {
           PERSIST_STATE: "1",
@@ -605,7 +831,9 @@ function miniStackRuntimeConfigFingerprint(options: {
       : {}),
     ...Object.fromEntries(
       Object.entries(options.config.environment ?? {})
-        .filter(([key]) => key !== "LAMBDA_DOCKER_FLAGS"),
+        .filter(([key]) => key !== "LAMBDA_DOCKER_FLAGS" &&
+          !(isCertifiedMiniStackImage(options.image) && Object.values(CERTIFIED_MINISTACK_COMPATIBILITY)
+            .some((recipe) => Object.prototype.hasOwnProperty.call(recipe.environment, key)))),
     ),
   };
   const stableEnvironment = Object.fromEntries(
@@ -616,6 +844,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     project_id: options.projectId,
     image: options.image,
     platform: options.platform,
+    compatibility_fingerprint: options.compatibility?.fingerprint ?? null,
     docker_socket: options.config.dockerSocket ?? "/var/run/docker.sock",
     persistence: options.config.persistence,
     volume_name: options.volumeName ?? null,

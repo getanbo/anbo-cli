@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, cp, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -46,6 +46,16 @@ try {
     encoding: "utf8",
   });
   if (install.status !== 0) throw new Error(install.stderr || install.stdout);
+  const installedRuntime = JSON.parse(await readFile(
+    join(temporary, "node_modules", "@getanbo", "plugin-ministack", "runtime-manifest.json"),
+    "utf8",
+  ));
+  assert.deepEqual(installedRuntime.platforms, ["linux/amd64", "linux/arm64"]);
+  assert.equal(installedRuntime.compatibility["linux/arm64"].environment.OPENSSL_armcap, "0");
+  assert.equal(
+    installedRuntime.certified_image,
+    `ministackorg/ministack@${installedRuntime.digest}`,
+  );
 
   await mkdir(join(project, ".anbo"), { recursive: true });
   await writeFile(join(project, ".anbo", "project.json"), JSON.stringify({
@@ -60,16 +70,35 @@ try {
   for (const line of configured.trim().split("\n")) JSON.parse(line);
 
   if (process.env.ANBO_ACCEPTANCE_RUNTIME === "1") {
-    const first = run(["deploy", "--target", "ministack", "--output", "jsonl"]);
-    const second = run(["deploy", "--target", "ministack", "--no-test", "--output", "jsonl"]);
-    assert.match(first, /"cache_hit":false/);
-    assert.match(first, /"kind":"test.assertion"/);
-    assert.match(second, /"cache_hit":true/);
-    assert.doesNotMatch(second, /"kind":"test.assertion"/);
-    run(["status", "--target", "ministack", "--output", "jsonl"]);
-    run(["test", "--target", "ministack", "--output", "jsonl"]);
-    run(["debug", "--target", "ministack", "--output", "jsonl"]);
-    run(["down", "--target", "ministack", "--purge", "--output", "jsonl"]);
+    let runtimeError;
+    try {
+      const first = run(["deploy", "--target", "ministack", "--output", "jsonl"]);
+      const second = run(["deploy", "--target", "ministack", "--no-test", "--output", "jsonl"]);
+      assert.match(first, /"cache_hit":false/);
+      assert.match(first, /"server_platform":"linux\/(?:amd64|arm64)"/);
+      const arm64Runtime = first.includes('"server_platform":"linux/arm64"');
+      if (arm64Runtime) assert.match(first, /"phase":"ministack.compatibility"/);
+      else assert.doesNotMatch(first, /"phase":"ministack.compatibility"/);
+      assert.match(first, /"name":"kms.generate-data-key"/);
+      assert.match(first, /"name":"kms.encrypt-decrypt"/);
+      assert.match(second, /"cache_hit":true/);
+      if (arm64Runtime) assert.match(second, /"workaround":"openssl-armcap-zero-v1".*"cache_hit":true/);
+      else assert.doesNotMatch(second, /"workaround":"openssl-armcap-zero-v1"/);
+      assert.doesNotMatch(second, /"kind":"test.assertion"/);
+      run(["status", "--target", "ministack", "--output", "jsonl"]);
+      const test = run(["test", "--target", "ministack", "--output", "jsonl"]);
+      assert.match(test, /"name":"kms.encrypt-decrypt"/);
+      run(["debug", "--target", "ministack", "--output", "jsonl"]);
+    } catch (error) {
+      runtimeError = error;
+      throw error;
+    } finally {
+      try {
+        run(["down", "--target", "ministack", "--purge", "--output", "jsonl"]);
+      } catch (cleanupError) {
+        if (runtimeError === undefined) throw cleanupError;
+      }
+    }
     run(["cache", "prune", "--target", "ministack", "--output", "jsonl"]);
   }
 } finally {

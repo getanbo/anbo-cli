@@ -12,10 +12,17 @@ if (tag?.startsWith("plugin-ministack-v")) {
 }
 if (requested) assert.equal(requested, pkg.version, "requested release must match package.json version");
 assert.equal(descriptor.version, pkg.version, "descriptor and package versions must match");
-assert.equal(runtime.source, "anbo-ministack", "release is blocked until the bootstrap pin is promoted to an Anbo MiniStack candidate");
+assert.equal(runtime.source, "ministackorg/ministack");
 assert.match(runtime.digest, /^sha256:[a-f0-9]{64}$/);
-assert.match(runtime.platform, /^linux\/(?:amd64|arm64)$/);
-assert.equal(runtime.certified_image, `ghcr.io/getanbo/anbo-ministack@${runtime.digest}`);
+assert.deepEqual(runtime.platforms, ["linux/amd64", "linux/arm64"]);
+assert.deepEqual(runtime.compatibility, {
+  "linux/arm64": {
+    id: "openssl-armcap-zero-v1",
+    environment: { OPENSSL_armcap: "0" },
+    certification: "native-full-ed25519-asyncssh-kms-v1",
+  },
+});
+assert.equal(runtime.certified_image, `ministackorg/ministack@${runtime.digest}`);
 assert.match(runtime.upstream.commit, /^[a-f0-9]{40}$/);
-assert.match(runtime.downstream.commit, /^[a-f0-9]{40}$/);
-assert.match(runtime.downstream.version, /^\d+\.\d+\.\d+-anbo\.(?:candidate\.)?[A-Za-z0-9._-]+$/);
+assert.match(runtime.upstream.version, /^\d+\.\d+\.\d+$/);
+assert.equal("downstream" in runtime, false);

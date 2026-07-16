@@ -11,8 +11,8 @@ import {
 
 test("capability matrix covers the certified full MiniStack surface", () => {
   assert.match(CERTIFIED_MINISTACK_DIGEST, /^sha256:[a-f0-9]{64}$/);
-  assert.equal(CERTIFIED_MINISTACK_IMAGE, `ghcr.io/getanbo/anbo-ministack@${CERTIFIED_MINISTACK_DIGEST}`);
-  assert.equal(CERTIFIED_MINISTACK_SOURCE, "anbo-ministack");
+  assert.equal(CERTIFIED_MINISTACK_IMAGE, `ministackorg/ministack@${CERTIFIED_MINISTACK_DIGEST}`);
+  assert.equal(CERTIFIED_MINISTACK_SOURCE, "ministackorg/ministack");
   assert.ok(SERVICE_CAPABILITIES.length >= 60);
   assert.equal(new Set(SERVICE_CAPABILITIES.map((entry) => entry.service)).size, SERVICE_CAPABILITIES.length);
   assert.equal(SERVICE_CAPABILITIES.find((entry) => entry.service === "EC2")?.fidelity, "control-plane-only");

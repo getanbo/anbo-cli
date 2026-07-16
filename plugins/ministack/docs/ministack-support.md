@@ -1,12 +1,15 @@
 # MiniStack Support
 
-Anbo 0.1 certifies the full multi-platform image at
-`ghcr.io/getanbo/anbo-ministack@sha256:cf29ce9cacd3982531b5f5bd48a7b46c10acaf4f44a10fb25831b3073c26b204`.
-It was built by `getanbo/anbo-ministack` commit
-`09aa7a0bc6869b5499e617d7c22ce728999c399d` from upstream MiniStack v1.4.2
-commit `25c2cbad8ff77108823359d3d5c8e92a44726acd`, then qualified through the
-installed canonical CLI acceptance suite. See `runtime-manifest.json` for the
-machine-readable provenance.
+The MiniStack plugin certifies the official full multi-platform image at
+`ministackorg/ministack@sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9`.
+It was built from upstream MiniStack v1.4.2 commit
+`25c2cbad8ff77108823359d3d5c8e92a44726acd` and qualified through the installed
+canonical CLI acceptance suite on both published platforms. See
+`runtime-manifest.json` for the machine-readable provenance.
+Benchmark controls that use MiniStack's default light image share this upstream
+commit and release, but not the image digest: Anbo deliberately certifies the
+official full edition because the plugin's product contract requires its
+full-image components.
 The matrix contains 71 service surfaces. It describes expected fidelity and is
 not a Terraform allowlist; use `anbo capabilities --json` for the exact current
 entries, requirements, endpoint names, and per-service limitations.
@@ -77,12 +80,19 @@ not treat them as a security boundary.
 ## Platform Notes
 
 Anbo reads the Docker server platform rather than inferring it from the Node
-host process. The current runtime manifest certifies `linux/amd64`, so Anbo
-selects that image platform deterministically on both amd64 and arm64 Docker
-servers and uses Docker emulation where necessary. MiniStack features that start
-containers, including Lambda, ECS, EKS, RDS, and ElastiCache, also require
-access to the local Docker daemon and may carry their own architecture
-constraints.
+host process. The current digest-pinned image index certifies `linux/amd64` and
+`linux/arm64`, so Anbo selects the Docker server's native platform and fails
+before creating resources when the reported platform is malformed or not
+certified. The pinned full image's OpenSSL capability detection can select an
+unsupported instruction under virtualized ARM CPUs, so Anbo sets
+`OPENSSL_armcap=0` only for the certified ARM64 runtime. Before reporting ready,
+the CLI verifies the native architecture, Ed25519, AsyncSSH, full-edition
+health, and a KMS encrypt/decrypt/data-key flow. Successful certification is
+cached as a Docker-local tag keyed by the exact image digest and recipe
+fingerprint; structured events distinguish a cold probe from a warm cache hit.
+MiniStack features that start containers, including Lambda, ECS,
+EKS, RDS, and ElastiCache, also require access to the local Docker daemon and
+may carry their own architecture constraints.
 
 MiniStack fidelity is version-specific. Replacing the certified tag or digest
 is an explicit compatibility change and should be validated through an installed

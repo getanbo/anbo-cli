@@ -47,8 +47,8 @@
     }
   },
   "ministack": {
-    "image": "ghcr.io/getanbo/anbo-ministack@sha256:cf29ce9cacd3982531b5f5bd48a7b46c10acaf4f44a10fb25831b3073c26b204",
-    "digest": "sha256:cf29ce9cacd3982531b5f5bd48a7b46c10acaf4f44a10fb25831b3073c26b204",
+    "image": "ministackorg/ministack@sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9",
+    "digest": "sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9",
     "profile": "full",
     "persistence": true,
     "environment": {

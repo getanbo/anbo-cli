@@ -35,12 +35,91 @@ class TestExecutor implements CommandExecutor {
   }
 }
 
-test("certified runtime selection uses Docker server metadata rather than the Node host", async () => {
+for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
+  test(`certified runtime selects native ${serverPlatform} with exact Docker arguments`, async () => {
+    let runArguments: readonly string[] = [];
+    let created = false;
+    const compatibilityEvents: Array<{ certificationCacheHit: boolean }> = [];
+    const executor = new TestExecutor(async (args) => {
+      if (args[0] === "version") return { code: 0, stdout: `${serverPlatform}\n`, stderr: "" };
+      if (args[0] === "image" && args[1] === "inspect") {
+        return { code: 0, stdout: `${CERTIFIED_MINISTACK_DIGEST}\n`, stderr: "" };
+      }
+      if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+      if (args[0] === "inspect") {
+        return created
+          ? { code: 0, stdout: runningInspection(runArguments), stderr: "" }
+          : { code: 1, stdout: "", stderr: "No such container" };
+      }
+      if (args[0] === "run") {
+        created = true;
+        runArguments = args;
+        return { code: 0, stdout: "container-id\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    });
+
+    const runtime = await startMiniStack({
+      projectId: "platform-selection",
+      image: CERTIFIED_MINISTACK_IMAGE,
+      digest: CERTIFIED_MINISTACK_DIGEST,
+      persistence: false,
+      stateRoot: "/tmp/unused",
+    }, {
+      commands: executor,
+      fetch: async () => Response.json({ edition: "full" }),
+      onCompatibility: async (metadata) => { compatibilityEvents.push(metadata); },
+    });
+
+    const runtimeConfigLabel = runArguments.find((value) => value.startsWith("anbo.dev/runtime-config="));
+    const compatibilityLabel = runArguments.find((value) => value.startsWith("anbo.dev/ministack-compatibility="));
+    const publishedPort = runArguments.find((value) => value.startsWith("127.0.0.1:") && value.endsWith(":4566"));
+    assert.ok(runtimeConfigLabel);
+    assert.ok(publishedPort);
+    assert.deepEqual(runArguments, [
+      "run", "--detach", "--name", "anbo-platform-selection-ministack",
+      "--platform", serverPlatform,
+      "--label", "anbo.dev/managed=true",
+      "--label", "anbo.dev/project=platform-selection",
+      "--label", "anbo.dev/component=ministack",
+      ...(serverPlatform === "linux/arm64" ? ["--label", compatibilityLabel] : []),
+      "--label", runtimeConfigLabel,
+      "--network", "anbo-platform-selection-runtime",
+      "--add-host", "host.docker.internal:host-gateway",
+      "--publish", publishedPort,
+      "--volume", "/var/run/docker.sock:/var/run/docker.sock",
+      "--env", "DOCKER_NETWORK=anbo-platform-selection-runtime",
+      "--env", "LAMBDA_EXECUTOR=docker",
+      "--env", "LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway",
+      "--env", "MINISTACK_REGION=us-east-1",
+      "--env", "MINISTACK_ACCOUNT_ID=000000000000",
+      ...(serverPlatform === "linux/arm64" ? ["--env", "OPENSSL_armcap=0"] : []),
+      CERTIFIED_MINISTACK_IMAGE,
+    ]);
+    assert.deepEqual(executor.calls[0]?.args, ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]);
+    assert.equal(runtime.platform, serverPlatform);
+    assert.equal(runtime.serverPlatform, serverPlatform);
+    if (serverPlatform === "linux/arm64") {
+      assert.ok(compatibilityLabel);
+      assert.equal(runtime.compatibility?.certificationCacheHit, true);
+      assert.deepEqual(compatibilityEvents.map((event) => event.certificationCacheHit), [true]);
+    } else {
+      assert.equal(compatibilityLabel, undefined);
+      assert.equal(runArguments.includes("OPENSSL_armcap=0"), false);
+      assert.equal(runtime.compatibility, undefined);
+      assert.deepEqual(compatibilityEvents, []);
+    }
+  });
+}
+
+test("ARM64 compatibility probes once and reuses only the exact certified image", async () => {
   let runArguments: readonly string[] = [];
   let created = false;
+  let certified = false;
+  const cacheHits: boolean[] = [];
   const executor = new TestExecutor(async (args) => {
     if (args[0] === "version") return { code: 0, stdout: "linux/arm64\n", stderr: "" };
-    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "No such network" };
     if (args[0] === "inspect") {
       return created
         ? { code: 0, stdout: runningInspection(runArguments), stderr: "" }
@@ -51,11 +130,81 @@ test("certified runtime selection uses Docker server metadata rather than the No
       runArguments = args;
       return { code: 0, stdout: "container-id\n", stderr: "" };
     }
+    if (args[0] === "image" && args[1] === "inspect") {
+      return certified
+        ? { code: 0, stdout: `${CERTIFIED_MINISTACK_DIGEST}\n`, stderr: "" }
+        : { code: 1, stdout: "", stderr: "No such image" };
+    }
+    if (args[0] === "exec") {
+      const script = args.at(-1) ?? "";
+      assert.match(script, /Ed25519PrivateKey/);
+      assert.match(script, /import asyncssh/);
+      assert.match(script, /generate_data_key/);
+      assert.match(script, /kms\.encrypt/);
+      assert.match(script, /kms\.decrypt/);
+      return {
+        code: 0,
+        stdout: '{"architecture":"aarch64","asyncssh":"2.24.0","ed25519":true,"kms":true}\n',
+        stderr: "",
+      };
+    }
+    if (args[0] === "image" && args[1] === "tag") {
+      certified = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const request = {
+    projectId: "arm64-certification",
+    image: CERTIFIED_MINISTACK_IMAGE,
+    digest: CERTIFIED_MINISTACK_DIGEST,
+    persistence: false,
+    stateRoot: "/tmp/unused",
+  };
+  const dependencies = {
+    commands: executor,
+    fetch: async () => Response.json({ edition: "full" }),
+    onCompatibility: async (metadata: { certificationCacheHit: boolean }) => {
+      cacheHits.push(metadata.certificationCacheHit);
+    },
+  };
+
+  const cold = await startMiniStack(request, dependencies);
+  const warm = await startMiniStack(request, dependencies);
+
+  assert.equal(cold.compatibility?.certificationCacheHit, false);
+  assert.equal(warm.compatibility?.certificationCacheHit, true);
+  assert.equal(warm.reused, true);
+  assert.deepEqual(cacheHits, [false, true]);
+  assert.equal(executor.calls.filter((call) => call.args[0] === "exec").length, 1);
+  assert.equal(executor.calls.filter((call) => call.args[0] === "image" && call.args[1] === "tag").length, 1);
+});
+
+test("ARM64 compatibility certification fails clearly and never records a cache tag", async () => {
+  let runArguments: readonly string[] = [];
+  let created = false;
+  const executor = new TestExecutor(async (args) => {
+    if (args[0] === "version") return { code: 0, stdout: "linux/arm64\n", stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "No such network" };
+    if (args[0] === "inspect") {
+      return created
+        ? { code: 0, stdout: runningInspection(runArguments), stderr: "" }
+        : { code: 1, stdout: "", stderr: "No such container" };
+    }
+    if (args[0] === "run") {
+      created = true;
+      runArguments = args;
+      return { code: 0, stdout: "container-id\n", stderr: "" };
+    }
+    if (args[0] === "image" && args[1] === "inspect") {
+      return { code: 1, stdout: "", stderr: "No such image" };
+    }
+    if (args[0] === "exec") return { code: 132, stdout: "", stderr: "Illegal instruction" };
     return { code: 0, stdout: "", stderr: "" };
   });
 
-  const runtime = await startMiniStack({
-    projectId: "platform-selection",
+  await assert.rejects(startMiniStack({
+    projectId: "arm64-certification-failure",
     image: CERTIFIED_MINISTACK_IMAGE,
     digest: CERTIFIED_MINISTACK_DIGEST,
     persistence: false,
@@ -63,19 +212,47 @@ test("certified runtime selection uses Docker server metadata rather than the No
   }, {
     commands: executor,
     fetch: async () => Response.json({ edition: "full" }),
-  });
-
-  const platformIndex = runArguments.indexOf("--platform");
-  assert.equal(runArguments[platformIndex + 1], "linux/amd64");
-  assert.equal(runtime.platform, "linux/amd64");
-  assert.equal(runtime.serverPlatform, "linux/arm64");
+  }), /ARM64 compatibility certification failed: Illegal instruction/);
+  assert.equal(executor.calls.some((call) => call.args[0] === "image" && call.args[1] === "tag"), false);
 });
+
+for (const scenario of [
+  {
+    name: "unsupported",
+    reported: "linux/riscv64",
+    message: /unsupported platform linux\/riscv64; MiniStack requires linux\/amd64 or linux\/arm64/,
+  },
+  {
+    name: "malformed",
+    reported: "linux-arm64",
+    message: /malformed platform linux-arm64; expected os\/architecture/,
+  },
+] as const) {
+  test(`certified runtime rejects ${scenario.name} Docker server platform before mutation`, async () => {
+    const executor = new TestExecutor(async (args) => args[0] === "version"
+      ? { code: 0, stdout: `${scenario.reported}\n`, stderr: "" }
+      : { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` });
+
+    await assert.rejects(startMiniStack({
+      projectId: "platform-rejection",
+      image: CERTIFIED_MINISTACK_IMAGE,
+      digest: CERTIFIED_MINISTACK_DIGEST,
+      persistence: false,
+      stateRoot: "/tmp/unused",
+    }, { commands: executor }), scenario.message);
+
+    assert.deepEqual(executor.calls.map((call) => call.args), [
+      ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"],
+    ]);
+  });
+}
 
 test("dead MiniStack containers fail immediately with bounded redacted evidence", async () => {
   let created = false;
   let sleeps = 0;
   const accessKey = `AKIA${"A".repeat(16)}`;
   const executor = new TestExecutor(async (args) => {
+    if (args[0] === "version") return { code: 0, stdout: "linux/amd64\n", stderr: "" };
     if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "missing" };
     if (args[0] === "inspect") {
       return created
@@ -104,7 +281,6 @@ test("dead MiniStack containers fail immediately with bounded redacted evidence"
     digest: `sha256:${"a".repeat(64)}`,
     persistence: false,
     stateRoot: "/tmp/unused",
-    platform: "linux/amd64",
   }, {
     commands: executor,
     fetch: async () => { throw new Error("fetch failed"); },
@@ -396,6 +572,7 @@ function runningInspection(runArguments: readonly string[]): string {
   const projectId = containerName.replace(/^anbo-/, "").replace(/-ministack$/, "");
   return JSON.stringify([{
     Id: "container-id",
+    Image: CERTIFIED_MINISTACK_DIGEST,
     Config: {
       Image: runArguments.at(-1),
       Env: ["LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway"],

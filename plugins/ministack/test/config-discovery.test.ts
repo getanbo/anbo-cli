@@ -58,7 +58,7 @@ test("manifest v2 accepts cloud and externally supplied clones without literal s
   assert.equal(parseManifest(manifest), manifest);
   assert.equal(
     manifest.ministack.image,
-    "ghcr.io/getanbo/anbo-ministack@sha256:cf29ce9cacd3982531b5f5bd48a7b46c10acaf4f44a10fb25831b3073c26b204",
+    "ministackorg/ministack@sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9",
   );
   assert.deepEqual(manifest.builds["lambda-zip"]?.outputs, ["dist/lambda.zip"]);
 });

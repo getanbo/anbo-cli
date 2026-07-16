@@ -33,6 +33,7 @@ import {
 } from "./runtime/clones.js";
 import {
   ProcessCommandExecutor,
+  pruneMiniStackCertification,
   safeProjectId,
   startMiniStack,
   stopMiniStack,
@@ -81,6 +82,12 @@ interface PersistedRuntimeState extends SupervisorState {
     host_endpoint: string;
     container_endpoint: string;
     image: string;
+    compatibility?: {
+      id: string;
+      fingerprint: string;
+      certification: string;
+      certification_cache_hit: boolean;
+    };
   };
   terraform?: {
     outputs: Record<string, unknown>;
@@ -279,6 +286,25 @@ async function deploySandbox(
     signal: infrastructureSignal,
     commands: request.commands ?? defaultCommands,
     redact: (text) => sink.redactor.redactString(text),
+    onCompatibility: async (metadata) => {
+      await sink.emit({
+        kind: "progress",
+        phase: "ministack.compatibility",
+        source: "ministack",
+        level: "info",
+        message: metadata.certificationCacheHit
+          ? "MiniStack ARM64 compatibility certification reused"
+          : "MiniStack ARM64 compatibility certified",
+        fields: {
+          platform: "linux/arm64",
+          workaround: metadata.id,
+          fingerprint: metadata.fingerprint,
+          certification: metadata.certification,
+          cache_hit: metadata.certificationCacheHit,
+        },
+        redacted: true,
+      });
+    },
     ...(request.fetch === undefined ? {} : { fetch: request.fetch }),
   }));
   // Cloud clone creation cannot be safely interrupted by a sibling failure: a
@@ -329,7 +355,13 @@ async function deploySandbox(
   await infrastructurePhase.finish("local infrastructure ready", {
     endpoint: miniStack.hostEndpoint,
     selected_platform: miniStack.platform,
-    server_platform: miniStack.serverPlatform ?? "explicit",
+    server_platform: miniStack.serverPlatform,
+    compatibility: miniStack.compatibility === undefined ? null : {
+      workaround: miniStack.compatibility.id,
+      fingerprint: miniStack.compatibility.fingerprint,
+      certification: miniStack.compatibility.certification,
+      cache_hit: miniStack.compatibility.certificationCacheHit,
+    },
     clone_count: Object.keys(clones).length,
     build_cache_hits: Object.fromEntries(Object.entries(builds).map(([name, result]) => [name, result.cacheHit])),
     build_engines: Object.fromEntries(Object.entries(builds).map(([name, result]) => [
@@ -1437,6 +1469,7 @@ async function cacheCommand(request: DeployRequest, projectId: string, cacheHome
   const cachePath = join(cacheHome, "anbo", "v2");
   if (action === "prune") {
     await pruneBuildCache(projectId, request.commands ?? defaultCommands, signal);
+    await pruneMiniStackCertification(request.commands ?? defaultCommands, signal);
     await rm(cachePath, { recursive: true, force: true });
     return { action: "cache", status: "succeeded", cache_action: "prune", path: cachePath };
   }
@@ -1556,6 +1589,14 @@ function persistedMiniStack(runtime: MiniStackRuntime): NonNullable<PersistedRun
     host_endpoint: runtime.hostEndpoint,
     container_endpoint: runtime.containerEndpoint,
     image: runtime.image,
+    ...(runtime.compatibility === undefined ? {} : {
+      compatibility: {
+        id: runtime.compatibility.id,
+        fingerprint: runtime.compatibility.fingerprint,
+        certification: runtime.compatibility.certification,
+        certification_cache_hit: runtime.compatibility.certificationCacheHit,
+      },
+    }),
   };
 }
 

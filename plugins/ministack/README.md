@@ -130,9 +130,15 @@ Cancellable readiness, build, and runtime work stops on the first real failure;
 an in-flight cloud clone create is allowed to return just long enough to persist
 branch ownership before its remaining readiness work is cancelled. Docker Buildx is used when
 available; otherwise the plugin falls back to the classic Docker builder rather
-than failing setup. The certified runtime platform is explicit and recorded in
-structured phase output, so host architecture heuristics cannot silently change
-the deployed runtime.
+than failing setup. The plugin reads the Docker server platform and selects its
+native amd64 or arm64 image from the certified, digest-pinned multi-platform
+index. Both the selected and reported platforms are recorded in structured
+phase output. On certified ARM64 Docker servers, the plugin injects the pinned
+`OPENSSL_armcap=0` compatibility setting required by MiniStack 1.4.2 under
+virtualized ARM CPUs. It certifies native architecture, Ed25519, AsyncSSH, the
+full health profile, and KMS before returning ready, then reuses a
+recipe-fingerprinted Docker-local certification tag on warm deploys. AMD64 does
+not receive this setting.
 
 A normal deploy skips a Terraform root only when its owned inputs, saved state
 metadata, filtered outputs, and the exact healthy MiniStack container process
@@ -186,11 +192,11 @@ return typed bindings and diagnostics. See [Adapter protocol v2](docs/adapters-v
 ## Runtime Pin
 
 [`runtime-manifest.json`](runtime-manifest.json) is the single audited runtime
-pin. It records the upstream MiniStack commit, the downstream Anbo MiniStack
-build commit, the exact multi-platform image index, and the image platform
-certified by the installed-CLI acceptance suite. The configured runtime is
-always the immutable `ghcr.io/getanbo/anbo-ministack@sha256:...` reference;
-mutable tags are never accepted as the release pin.
+pin. It records the upstream MiniStack commit, exact official multi-platform
+full-image index, every certified image platform, and the ARM64 compatibility
+recipe. The configured runtime is always the immutable
+`ministackorg/ministack@sha256:...` reference; mutable tags are never accepted
+as the release pin.
 
 ## Development
 
