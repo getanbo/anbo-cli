@@ -74,5 +74,8 @@
     "@types/node": "^22.10.0",
     "typescript": "^5.7.2"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@balena/dockerignore": "^1.0.2"
+  }
 }

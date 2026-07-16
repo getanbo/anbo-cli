@@ -76,9 +76,19 @@ test("persists secret-free state and rejects credential material", async () => {
     projectName: "Notes",
   });
 
-  await supervisor.writeState({ clone_id: "clone-123", credential_ref: "env://ANBO_TOKEN" });
+  await supervisor.writeState({
+    clone_id: "clone-123",
+    credential_ref: "env://ANBO_TOKEN",
+    resource_ids: {
+      secret: "arn:aws:secretsmanager:us-east-1:000000000000:secret:notes-application-123456",
+    },
+  });
   const state = await supervisor.readState();
   assert.equal(state?.clone_id, "clone-123");
+  assert.equal(
+    (state?.resource_ids as { secret?: string } | undefined)?.secret,
+    "arn:aws:secretsmanager:us-east-1:000000000000:secret:notes-application-123456",
+  );
   assert.equal(state?.logical_project_id, "notes");
   assert.equal(state?.project_name, "Notes");
   await assert.rejects(

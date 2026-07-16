@@ -23,6 +23,7 @@ import {
 } from "./types.js";
 import { buildDeclaredImages, pruneBuildCache, type BuildResult } from "./runtime/cache.js";
 import {
+  AmbiguousCloneCreateError,
   acquireConfiguredClones,
   purgeOwnedClones,
   readCloneState,
@@ -49,7 +50,9 @@ import {
   type ServiceRuntimeContext,
 } from "./runtime/services.js";
 import {
+  removeProjectTerraformWorkers,
   runTerraform,
+  TerraformPhaseError,
   type TerraformChangeSummary,
   type TerraformLifecycleEvent,
   type TerraformRunResult,
@@ -64,6 +67,7 @@ import {
   type TerraformStateMetadata,
 } from "./runtime/terraform-reconciliation.js";
 import { injectLambdaCloneBindings } from "./runtime/lambda-overlays.js";
+import { isSensitiveKey } from "./redaction.js";
 
 interface PersistedRuntimeState extends SupervisorState {
   status?: string;
@@ -151,54 +155,67 @@ export async function runDeploy(request: DeployRequest, sink: PluginEventSink): 
       kind: request.action,
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     }, async (operation) => {
-      phase = request.action;
-      switch (request.action) {
-        case "deploy":
-          return await deploySandbox(request, supervisor, sink, operation.signal, cacheHome, false, (next) => { phase = next; });
-        case "reset":
-          return await deploySandbox(request, supervisor, sink, operation.signal, cacheHome, true, (next) => { phase = next; });
-        case "test":
-          return await testExistingSandbox(request, supervisor, sink, operation.signal, (next) => { phase = next; });
-        case "run":
-          return await runInSandbox(request, supervisor, sink, operation.signal);
-        case "down":
-          return await downSandbox(request, supervisor, sink, operation.signal);
-        case "status":
-          return await statusSandbox(supervisor, sink);
-        case "logs":
-          return await logsSandbox(request, supervisor, sink, operation.signal);
-        case "debug":
-          return await debugRun(request, supervisor, sink);
-        case "capabilities":
-          return { action: "capabilities", status: "succeeded", capabilities: getCapabilityReport() } satisfies RunSummary;
-        case "cache":
-          return await cacheCommand(request, projectId, cacheHome, operation.signal);
+      try {
+        phase = request.action;
+        switch (request.action) {
+          case "deploy":
+            return await deploySandbox(request, supervisor, sink, operation.signal, cacheHome, false, (next) => { phase = next; });
+          case "reset":
+            return await deploySandbox(request, supervisor, sink, operation.signal, cacheHome, true, (next) => { phase = next; });
+          case "test":
+            return await testExistingSandbox(request, supervisor, sink, operation.signal, (next) => { phase = next; });
+          case "run":
+            return await runInSandbox(request, supervisor, sink, operation.signal);
+          case "down":
+            return await downSandbox(request, supervisor, sink, operation.signal);
+          case "status":
+            return await statusSandbox(supervisor, sink);
+          case "logs":
+            return await logsSandbox(request, supervisor, sink, operation.signal);
+          case "debug":
+            return await debugRun(request, supervisor, sink, operation.signal);
+          case "capabilities":
+            return { action: "capabilities", status: "succeeded", capabilities: getCapabilityReport() } satisfies RunSummary;
+          case "cache":
+            return await cacheCommand(request, projectId, cacheHome, operation.signal);
+        }
+      } catch (cause) {
+        const classified = classifyRuntimeError(cause, phase, operation.signal);
+        const failurePhase = classified.details?.phase ?? phase;
+        const error = new AnboError(classified.message, {
+          exitCode: classified.exitCode,
+          code: classified.code,
+          cause: classified,
+          details: {
+            ...classified.details,
+            phase: failurePhase,
+            evidence: classified.details?.evidence ?? { phase: failurePhase },
+          },
+        });
+        const observational = request.action === "status" || request.action === "logs" || request.action === "debug" ||
+          request.action === "capabilities" || request.action === "cache";
+        if (!observational) {
+          const current = await supervisor.readState<PersistedRuntimeState>().catch(() => undefined);
+          const runtimeInvalidated = request.action === "deploy" || request.action === "reset" || request.action === "down";
+          await supervisor.writeState({
+            ...(current ?? {}),
+            ...(runtimeInvalidated ? { status: "failed" } : {}),
+            last_operation: { action: request.action, status: "failed", phase: failurePhase },
+            last_run_id: sink.runId,
+            last_failure: {
+              code: error.code,
+              message: sink.redactor.redactString(error.message),
+              remediation: error.details?.remediation ?? remediationForPhase(phase),
+              phase: failurePhase,
+            },
+          }).catch(() => undefined);
+        }
+        throw error;
       }
     });
     return summary;
   } catch (cause) {
-    const error = classifyRuntimeError(cause, phase, request.signal);
-    await sink.diagnostic({
-      code: error.code,
-      cause: error.message,
-      evidence: { phase },
-      remediation: error.details?.remediation ?? remediationForPhase(phase),
-      retryable: error.details?.retryable ?? true,
-      safe_to_retry: error.details?.safe_to_retry ?? true,
-      phase,
-    }).catch(() => undefined);
-    const current = await supervisor.readState<PersistedRuntimeState>().catch(() => undefined);
-    await supervisor.writeState({
-      ...(current ?? {}),
-      last_run_id: sink.runId,
-      last_failure: {
-        code: error.code,
-        message: sink.redactor.redactString(error.message),
-        remediation: error.details?.remediation ?? remediationForPhase(phase),
-        phase,
-      },
-    }).catch(() => undefined);
-    throw error;
+    throw classifyRuntimeError(cause, phase, request.signal);
   } finally {
     stopHeartbeat();
   }
@@ -241,41 +258,61 @@ async function deploySandbox(
 
   reportPhase("infrastructure");
   const infrastructurePhase = await sink.startPhase("local infrastructure", "ministack");
-  const miniStackPromise = startMiniStack({
+  const infrastructureAbort = new AbortController();
+  const infrastructureSignal = AbortSignal.any([signal, infrastructureAbort.signal]);
+  let firstInfrastructureFailure: { phase: "ministack" | "clone" | "build"; cause: unknown } | undefined;
+  const branch = <T>(phase: "ministack" | "clone" | "build", run: () => Promise<T>): Promise<T> => run().catch((cause: unknown) => {
+    if (firstInfrastructureFailure === undefined && !signal.aborted) {
+      firstInfrastructureFailure = { phase, cause };
+      infrastructureAbort.abort(cause);
+    }
+    throw cause;
+  });
+  const miniStackPromise = branch("ministack", async () => await startMiniStack({
     projectId,
     image: request.manifest.ministack.image,
     ...(request.manifest.ministack.digest === undefined ? {} : { digest: request.manifest.ministack.digest }),
     persistence: request.manifest.ministack.persistence,
     stateRoot: supervisor.stateDirectory,
     environment: request.manifest.ministack.environment,
-    ...(signal === undefined ? {} : {}),
   }, {
-    signal,
+    signal: infrastructureSignal,
     commands: request.commands ?? defaultCommands,
+    redact: (text) => sink.redactor.redactString(text),
     ...(request.fetch === undefined ? {} : { fetch: request.fetch }),
-  });
-  const clonePromise = acquireRequestClones(request, supervisor, sink, signal);
-  const buildPromise = buildDeclaredImages({
+  }));
+  // Cloud clone creation cannot be safely interrupted by a sibling failure: a
+  // POST may succeed after its client is aborted. The clone runtime persists
+  // branch ownership first, then the infrastructure signal can stop polling.
+  const clonePromise = branch("clone", async () => await acquireRequestClones(
+    request,
+    supervisor,
+    sink,
+    signal,
+    infrastructureSignal,
+  ));
+  const buildPromise = branch("build", async () => await buildDeclaredImages({
     projectId,
     root: request.root,
     builds: request.manifest.builds,
     cacheRoot: join(cacheHome, "anbo", "v2", "buildkit"),
-    signal,
+    signal: infrastructureSignal,
   }, {
     commands: request.commands ?? defaultCommands,
     onOutput: async (build, stream, text) => { await sink.processOutput({ phase: "build", source: "buildkit", service: build, stream, chunk: text }); },
-  });
-  const infrastructure = await Promise.allSettled([miniStackPromise, clonePromise, buildPromise]);
-  const failedInfrastructureIndex = infrastructure.findIndex((result) => result.status === "rejected");
-  if (failedInfrastructureIndex >= 0) {
-    const failed = infrastructure[failedInfrastructureIndex];
-    const failurePhase = (["ministack", "clone", "build"] as const)[failedInfrastructureIndex] ?? "infrastructure";
-    reportPhase(failurePhase);
-    if (failed?.status === "rejected") throw classifyRuntimeError(failed.reason, failurePhase, signal);
+  }));
+  let miniStack: MiniStackRuntime;
+  let clones: Record<string, CloneLease>;
+  let builds: Record<string, BuildResult>;
+  try {
+    [miniStack, clones, builds] = await Promise.all([miniStackPromise, clonePromise, buildPromise]);
+  } catch (cause) {
+    infrastructureAbort.abort(cause);
+    await Promise.allSettled([miniStackPromise, clonePromise, buildPromise]);
+    const failure = firstInfrastructureFailure ?? { phase: "infrastructure" as const, cause };
+    reportPhase(failure.phase);
+    throw classifyRuntimeError(failure.cause, failure.phase, signal);
   }
-  const miniStack = infrastructure[0].status === "fulfilled" ? infrastructure[0].value : neverReached();
-  const clones = infrastructure[1].status === "fulfilled" ? infrastructure[1].value : neverReached();
-  const builds = infrastructure[2].status === "fulfilled" ? infrastructure[2].value : neverReached();
   if (resetting) {
     const response = await (request.fetch ?? globalThis.fetch)(`${miniStack.hostEndpoint}/_ministack/reset`, { method: "POST", signal });
     if (!response.ok) throw new Error(`MiniStack reset failed with HTTP ${response.status}`);
@@ -291,8 +328,14 @@ async function deploySandbox(
   }
   await infrastructurePhase.finish("local infrastructure ready", {
     endpoint: miniStack.hostEndpoint,
+    selected_platform: miniStack.platform,
+    server_platform: miniStack.serverPlatform ?? "explicit",
     clone_count: Object.keys(clones).length,
     build_cache_hits: Object.fromEntries(Object.entries(builds).map(([name, result]) => [name, result.cacheHit])),
+    build_engines: Object.fromEntries(Object.entries(builds).map(([name, result]) => [
+      name,
+      result.cacheHit ? "cache" : result.metadata["build_engine"] ?? "command",
+    ])),
   });
 
   reportPhase("terraform");
@@ -489,6 +532,17 @@ async function applyTerraformRoots(
             : { environment: request.manifest.ministack.environment }),
         },
         terraform: { region: "us-east-1", accountId: "000000000000" },
+      }, {
+        treeHashCachePath: join(
+          cacheHome,
+          "anbo",
+          "v2",
+          "terraform",
+          "fingerprints",
+          supervisor.projectId,
+          stateKey,
+          "tree-v1.json",
+        ),
       });
       await emitTerraformLifecycle(sink, root, index, {
         phase: "terraform.fingerprint",
@@ -542,6 +596,7 @@ async function applyTerraformRoots(
     }
 
     const result = await runTerraform({
+      projectId: supervisor.projectId,
       projectDirectory: request.root,
       sourceDirectory,
       privateDirectory,
@@ -1000,6 +1055,7 @@ async function acquireRequestClones(
   supervisor: ProjectSupervisor,
   sink: PluginEventSink,
   signal: AbortSignal,
+  readinessSignal?: AbortSignal,
 ): Promise<Partial<Record<"postgres" | "dynamodb", CloneLease>>> {
   const statusEvents: Array<Promise<unknown>> = [];
   try {
@@ -1012,6 +1068,7 @@ async function acquireRequestClones(
       ...(request.env["ANBO_API_URL"] === undefined ? {} : { apiUrl: request.env["ANBO_API_URL"] }),
       tokenReference: "env://ANBO_TOKEN",
       signal,
+      ...(readinessSignal === undefined ? {} : { readinessSignal }),
     }, {
       ...(request.fetch === undefined ? {} : { fetch: request.fetch }),
       registerSecret: (secret) => sink.redactor.registerSecret(secret),
@@ -1054,6 +1111,7 @@ async function downSandbox(request: DeployRequest, supervisor: ProjectSupervisor
   await invokeAdaptersForAction(request, sink, signal, "release", {});
   await invokeAdaptersForAction(request, sink, signal, "teardown", {});
   await stopDeclaredServices(supervisor.projectId, request.commands ?? defaultCommands, signal);
+  await removeProjectTerraformWorkers(supervisor.projectId, request.commands ?? defaultCommands, signal);
   // Clone retention is independent from the reusable local MiniStack snapshot.
   await stopMiniStack(supervisor.projectId, { purge: purgeLocal, commands: request.commands ?? defaultCommands, signal });
   if (purgeLocal) await rm(join(supervisor.stateDirectory, "terraform"), { recursive: true, force: true });
@@ -1095,7 +1153,7 @@ async function invokeAdaptersForAction(
 ): Promise<Record<string, AdapterResponse>> {
   const responses: Record<string, AdapterResponse> = {};
   const logicalProjectId = request.manifest.project.id ?? request.manifest.project.name;
-  const runtimeProjectId = deriveRuntimeProjectId(logicalProjectId, request.root);
+  const runtimeProjectId = request.runtimeProjectId ?? deriveRuntimeProjectId(logicalProjectId, request.root);
   for (const [name, config] of Object.entries(request.manifest.adapters)) {
     const response = await invokeAdapter(name, config, {
       schema_version: 2,
@@ -1125,7 +1183,8 @@ async function invokeAdaptersForAction(
     }
     const missing = (config.capabilities ?? []).filter((capability) => !response.capabilities.includes(capability));
     if (missing.length > 0) throw new Error(`adapter ${name} did not provide declared capabilities: ${missing.join(", ")}`);
-    for (const diagnostic of response.diagnostics) {
+    const adapterError = response.diagnostics.find((diagnostic) => diagnostic.level === "error");
+    for (const diagnostic of response.diagnostics.filter((entry) => entry.level !== "error")) {
       await sink.diagnostic({
         code: diagnostic.code,
         cause: diagnostic.message,
@@ -1134,11 +1193,21 @@ async function invokeAdaptersForAction(
         safe_to_retry: diagnostic.retryable ?? false,
         phase: `adapter.${action}`,
         source: name,
-        level: diagnostic.level === "error" ? "error" : "warn",
+        level: "warn",
       });
     }
-    if (response.diagnostics.some((diagnostic) => diagnostic.level === "error")) {
-      throw new Error(`adapter ${name} reported an error during ${action}`);
+    if (adapterError !== undefined) {
+      throw new AnboError(adapterError.message, {
+        exitCode: ExitCode.Runtime,
+        code: adapterError.code,
+        details: {
+          remediation: adapterError.remediation ?? `Inspect adapter ${name} configuration.`,
+          retryable: adapterError.retryable ?? false,
+          safe_to_retry: adapterError.retryable ?? false,
+          phase: `adapter.${action}`,
+          evidence: { adapter: name, action },
+        },
+      });
     }
     responses[name] = response;
   }
@@ -1151,11 +1220,32 @@ async function statusSandbox(supervisor: ProjectSupervisor, _sink: PluginEventSi
 }
 
 async function logsSandbox(request: DeployRequest, supervisor: ProjectSupervisor, sink: PluginEventSink, signal: AbortSignal): Promise<RunSummary> {
-  const state = await requireReadyState(supervisor);
+  const state = await supervisor.readState<PersistedRuntimeState>();
   const requestedService = typeof request.flags["service"] === "string" ? request.flags["service"] : undefined;
-  const services = Object.values(state.services ?? {}).filter((service) => requestedService === undefined || service.name === requestedService);
-  if (requestedService !== undefined && services.length === 0) throw new Error(`unknown running service ${requestedService}`);
-  if (services.length === 0) throw new Error("sandbox has no running services");
+  const persistedServices = Object.values(state?.services ?? {}).map((service) => ({
+    name: service.name,
+    containerName: service.containerName,
+  }));
+  const discovered = await inspectProjectContainers(
+    supervisor.projectId,
+    request.commands ?? defaultCommands,
+    signal,
+    false,
+    (value) => sink.redactor.redactString(value),
+    (value) => sink.redactor.registerSecret(value),
+  );
+  const candidates = [...new Map([
+    ...persistedServices,
+    ...discovered.map((container) => ({ name: container.service, containerName: container.name })),
+  ].map((service) => [service.containerName, service])).values()];
+  const services = candidates.filter((service) => requestedService === undefined ||
+    service.name === requestedService || service.containerName === requestedService);
+  if (requestedService !== undefined && services.length === 0) {
+    throw new Error(`unknown project container or running service ${requestedService}`);
+  }
+  if (services.length === 0) {
+    throw new Error("sandbox has no project containers; run `anbo debug --target ministack --output json` for the recorded failure");
+  }
   const follow = request.flags["follow"] === true;
   await Promise.all(services.map(async (service) => {
     const args = ["logs", "--timestamps", "--tail", "all", ...(follow ? ["--follow"] : []), service.containerName];
@@ -1169,29 +1259,177 @@ async function logsSandbox(request: DeployRequest, supervisor: ProjectSupervisor
         commandLabel: `logs ${service.name}`,
       });
     } else {
-      await (request.commands ?? defaultCommands).run("docker", args, {
+      const result = await (request.commands ?? defaultCommands).run("docker", args, {
         signal,
         onOutput: async (stream, chunk) => { await sink.processOutput({ phase: "logs", source: "docker.logs", service: service.name, stream, chunk }); },
       });
+      if (result.code !== 0) {
+        const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+        throw new Error(`could not read logs for ${service.name}: ${sink.redactor.redactString(detail)}`);
+      }
     }
   }));
   return { action: "logs", status: "succeeded", services: services.map((service) => service.name), follow };
 }
 
-async function debugRun(request: DeployRequest, supervisor: ProjectSupervisor, _sink: PluginEventSink): Promise<RunSummary> {
+interface ProjectContainerEvidence {
+  id: string;
+  name: string;
+  service: string;
+  component: string;
+  image?: string;
+  running?: boolean;
+  status?: string;
+  exit_code?: number;
+  error?: string;
+  health?: string;
+  logs?: string;
+}
+
+async function debugRun(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+  sink: PluginEventSink,
+  signal: AbortSignal,
+): Promise<RunSummary> {
   const state = await supervisor.readState<PersistedRuntimeState>();
-  const runId = request.args[0] ?? state?.last_run_id;
+  const requestedRunId = request.args[0];
+  if (requestedRunId !== undefined && requestedRunId !== state?.last_run_id) {
+    throw new AnboError(`debug evidence for run ${requestedRunId} is unavailable`, {
+      exitCode: ExitCode.Configuration,
+      code: "ANBO_DEBUG_RUN_NOT_FOUND",
+      details: {
+        remediation: state?.last_run_id === undefined
+          ? "Run anbo deploy first, then pass the run ID reported by that operation."
+          : `Retry anbo debug with the latest recorded run ID: ${state.last_run_id}`,
+        retryable: false,
+        safe_to_retry: false,
+        evidence: {
+          requested_run_id: requestedRunId,
+          ...(state?.last_run_id === undefined ? {} : { latest_run_id: state.last_run_id }),
+        },
+      },
+    });
+  }
+  const runId = requestedRunId ?? state?.last_run_id;
   if (runId === undefined) throw new Error("no previous run is available to debug");
   const failure = state?.last_failure;
+  const containers = await inspectProjectContainers(
+    supervisor.projectId,
+    request.commands ?? defaultCommands,
+    signal,
+    true,
+    (value) => sink.redactor.redactString(value),
+    (value) => sink.redactor.registerSecret(value),
+  );
   return {
     action: "debug",
     status: "succeeded",
     inspected_run_id: runId,
     runtime_status: state?.status ?? "not-deployed",
     diagnostics: failure === undefined ? [] : [{ code: failure.code, message: failure.message, remediation: failure.remediation }],
-    evidence: failure === undefined ? {} : { phase: failure.phase },
+    evidence: {
+      ...(failure === undefined ? {} : { phase: failure.phase }),
+      containers,
+    },
     remediation: failure?.remediation ?? "No MiniStack runtime failure is recorded. Inspect the core run events for this run ID.",
   };
+}
+
+async function inspectProjectContainers(
+  projectId: string,
+  commands: import("./runtime/ministack.js").CommandExecutor,
+  signal: AbortSignal,
+  includeLogs: boolean,
+  redact: (value: string) => string = (value) => value,
+  registerSecret: (value: string) => void = () => undefined,
+): Promise<ProjectContainerEvidence[]> {
+  const listed = await commands.run("docker", [
+    "ps", "-aq", "--filter", `label=anbo.dev/project=${projectId}`,
+  ], { signal });
+  if (listed.code !== 0) {
+    const detail = listed.stderr.trim() || listed.stdout.trim() || `exit code ${listed.code}`;
+    throw new Error(`could not inspect project containers: ${redact(detail)}`);
+  }
+  const ids = listed.stdout.split(/\s+/).filter(Boolean);
+  const inspectedContainers = await Promise.all(ids.map(async (id): Promise<{
+    id: string;
+    evidence: ProjectContainerEvidence;
+    rawError?: string;
+  } | undefined> => {
+    const inspected = await commands.run("docker", ["inspect", id], { signal });
+    if (inspected.code !== 0) return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(inspected.stdout);
+    } catch {
+      return undefined;
+    }
+    const record = Array.isArray(parsed) && isRecord(parsed[0]) ? parsed[0] : undefined;
+    if (record === undefined) return undefined;
+    const config = isRecord(record["Config"]) ? record["Config"] : {};
+    registerSensitiveEnvironment(config["Env"], registerSecret);
+    const labels = isRecord(config["Labels"]) ? config["Labels"] : {};
+    const state = isRecord(record["State"]) ? record["State"] : {};
+    const health = isRecord(state["Health"]) ? state["Health"] : {};
+    const rawName = typeof record["Name"] === "string" ? record["Name"].replace(/^\//, "") : id;
+    const component = typeof labels["anbo.dev/component"] === "string"
+      ? labels["anbo.dev/component"]
+      : "container";
+    const prefix = `anbo-${projectId}-`;
+    const service = component === "service" && rawName.startsWith(prefix)
+      ? rawName.slice(prefix.length)
+      : component;
+    return {
+      id,
+      evidence: {
+        id: typeof record["Id"] === "string" ? record["Id"] : id,
+        name: rawName,
+        service,
+        component,
+        ...(typeof config["Image"] === "string" ? { image: config["Image"] } : {}),
+        ...(typeof state["Running"] === "boolean" ? { running: state["Running"] } : {}),
+        ...(typeof state["Status"] === "string" ? { status: state["Status"] } : {}),
+        ...(typeof state["ExitCode"] === "number" ? { exit_code: state["ExitCode"] } : {}),
+        ...(typeof health["Status"] === "string" ? { health: health["Status"] } : {}),
+      },
+      ...(typeof state["Error"] === "string" && state["Error"].length > 0 ? { rawError: state["Error"] } : {}),
+    };
+  }));
+  // Inspection is deliberately a separate pass: every container secret must
+  // be registered before any sibling's error or log tail is rendered.
+  const available = inspectedContainers.filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+  return await Promise.all(available.map(async ({ id, evidence, rawError }) => {
+    let logs: string | undefined;
+    if (includeLogs) {
+      const logged = await commands.run("docker", ["logs", "--timestamps", "--tail", "80", id], { signal });
+      const combined = [logged.stdout, logged.stderr].filter((value) => value.trim().length > 0).join("\n");
+      if (combined.length > 0) logs = boundedDebugTail(redact(combined), 8_192);
+    }
+    return {
+      ...evidence,
+      ...(rawError === undefined ? {} : { error: redact(rawError) }),
+      ...(logs === undefined ? {} : { logs }),
+    };
+  }));
+}
+
+function registerSensitiveEnvironment(value: unknown, registerSecret: (value: string) => void): void {
+  if (!Array.isArray(value)) return;
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const separator = entry.indexOf("=");
+    if (separator <= 0) continue;
+    const name = entry.slice(0, separator);
+    const secret = entry.slice(separator + 1);
+    if (isSensitiveKey(name) || /(?:^|[_-])(?:dsn|uri|url|endpoint)(?:$|[_-])/i.test(name)) {
+      registerSecret(secret);
+    }
+  }
+}
+
+function boundedDebugTail(value: string, maximumLength: number): string {
+  return value.length <= maximumLength ? value : `[...truncated...]\n${value.slice(-maximumLength)}`;
 }
 
 async function cacheCommand(request: DeployRequest, projectId: string, cacheHome: string, signal: AbortSignal): Promise<RunSummary> {
@@ -1262,15 +1500,25 @@ function safeAdapterSummary(adapters: Readonly<Record<string, AdapterResponse>>)
 }
 
 function registerDeclaredEnvironmentSecrets(request: DeployRequest, sink: PluginEventSink): void {
+  for (const [name, value] of Object.entries(request.env)) {
+    if (isSensitiveKey(name)) sink.redactor.registerSecret(value);
+  }
   const environments = [
+    request.manifest.ministack.environment ?? {},
     ...Object.values(request.manifest.services).map((service) => service.environment ?? {}),
     ...Object.values(request.manifest.tests).map((test) => test.environment ?? {}),
   ];
   for (const environment of environments) {
-    for (const reference of Object.values(environment)) {
+    for (const [key, reference] of Object.entries(environment)) {
       const name = reference.match(/^env:\/\/([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
       const value = name === undefined ? undefined : request.env[name];
       if (value !== undefined && value.length > 0) sink.redactor.registerSecret(value);
+      if (isSensitiveKey(key) && name === undefined) sink.redactor.registerSecret(reference);
+    }
+  }
+  for (const build of Object.values(request.manifest.builds)) {
+    for (const [key, value] of Object.entries(build.args ?? {})) {
+      if (isSensitiveKey(key)) sink.redactor.registerSecret(value);
     }
   }
 }
@@ -1319,6 +1567,15 @@ function requiredEnvironment(environment: Readonly<NodeJS.ProcessEnv>, name: str
 
 export function classifyRuntimeError(cause: unknown, phase: string, signal?: AbortSignal): AnboError {
   if (cause instanceof AnboError) return cause;
+  if (cause instanceof TerraformPhaseError) {
+    const classified = classifyRuntimeError(cause.cause ?? cause.message, cause.phase, signal);
+    return new AnboError(classified.message, {
+      exitCode: classified.exitCode,
+      code: classified.code,
+      details: { ...classified.details, phase: cause.phase },
+      cause,
+    });
+  }
   if (cause instanceof OperationLockedError) {
     return new AnboError(cause.message, {
       exitCode: ExitCode.LockConflict,
@@ -1332,18 +1589,41 @@ export function classifyRuntimeError(cause: unknown, phase: string, signal?: Abo
       cause,
     });
   }
+  if (cause instanceof AmbiguousCloneCreateError) {
+    return new AnboError(cause.message, {
+      exitCode: signal?.aborted === true ? ExitCode.Cancelled : ExitCode.Clone,
+      code: "ANBO_CLONE_CREATE_UNCERTAIN",
+      details: {
+        remediation: `Inspect the cloning service for branch ${cause.branchName}; reconcile or remove that branch before retrying the deploy.`,
+        retryable: true,
+        safe_to_retry: false,
+        evidence: { branch_name: cause.branchName },
+      },
+      cause,
+    });
+  }
   if (signal?.aborted === true || (cause instanceof Error && cause.name === "AbortError")) {
     if (signal?.reason instanceof Error && signal.reason.name === "TimeoutError") {
-      return new AnboError("operation exceeded its deadline", { exitCode: ExitCode.Deadline, code: "ANBO_DEADLINE", cause });
+      return new AnboError("operation exceeded its deadline", {
+        exitCode: ExitCode.Deadline,
+        code: "ANBO_DEADLINE",
+        details: { retryable: true, safe_to_retry: true, remediation: remediationForPhase(phase) },
+        cause,
+      });
     }
-    return new AnboError("operation cancelled", { exitCode: ExitCode.Cancelled, code: "ANBO_CANCELLED", cause });
+    return new AnboError("operation cancelled", {
+      exitCode: ExitCode.Cancelled,
+      code: "ANBO_CANCELLED",
+      details: { retryable: true, safe_to_retry: true, remediation: "Retry the command when cancellation is no longer requested." },
+      cause,
+    });
   }
   if (isDockerPrerequisiteFailure(cause)) {
     return new AnboError(cause instanceof Error ? cause.message : String(cause), {
       exitCode: ExitCode.Prerequisite,
       code: "ANBO_DOCKER_UNAVAILABLE",
       details: {
-        remediation: "Install and start Docker, then verify `docker info` and `docker buildx version` succeed before retrying.",
+        remediation: "Install and start Docker, then verify `docker info` succeeds before retrying. Buildx is optional because Anbo can safely fall back to the classic Docker builder.",
         retryable: true,
         safe_to_retry: true,
       },
@@ -1354,6 +1634,11 @@ export function classifyRuntimeError(cause: unknown, phase: string, signal?: Abo
   return new AnboError(cause instanceof Error ? cause.message : String(cause), {
     exitCode,
     code: `ANBO_${phase.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase()}_FAILED`,
+    details: {
+      remediation: remediationForPhase(phase),
+      retryable: false,
+      safe_to_retry: true,
+    },
     cause,
   });
 }
@@ -1384,8 +1669,4 @@ function isDockerPrerequisiteFailure(cause: unknown): boolean {
     break;
   }
   return false;
-}
-
-function neverReached(): never {
-  throw new Error("parallel infrastructure setup ended without a result");
 }

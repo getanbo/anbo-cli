@@ -2,7 +2,12 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:net";
 
-import { CERTIFIED_MINISTACK_DIGEST, CERTIFIED_MINISTACK_IMAGE } from "../distribution.js";
+import {
+  CERTIFIED_MINISTACK_DIGEST,
+  CERTIFIED_MINISTACK_IMAGE,
+  CERTIFIED_MINISTACK_PLATFORM,
+} from "../distribution.js";
+import { Redactor } from "../redaction.js";
 
 export interface RuntimeCommandOptions {
   cwd?: string;
@@ -10,6 +15,8 @@ export interface RuntimeCommandOptions {
   input?: string | Uint8Array;
   signal?: AbortSignal;
   onOutput?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
+  /** Run only the teardown command even when the enclosing operation was cancelled. */
+  cleanup?: boolean;
 }
 
 export interface RuntimeCommandResult {
@@ -95,6 +102,10 @@ export interface MiniStackRuntime {
   hostEndpoint: string;
   containerEndpoint: string;
   image: string;
+  /** Platform selected for the certified runtime image. */
+  platform: string;
+  /** Platform reported by the Docker server, when platform selection required discovery. */
+  serverPlatform?: string;
   edition: "full";
 }
 
@@ -104,6 +115,7 @@ export interface MiniStackDependencies {
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   signal?: AbortSignal;
+  redact?: (text: string) => string;
 }
 
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/i;
@@ -143,9 +155,17 @@ export async function startMiniStack(
   const fetcher = dependencies.fetch ?? globalThis.fetch;
   const sleep = dependencies.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const now = dependencies.now ?? Date.now;
+  const defaultRedactor = new Redactor();
+  const redact = dependencies.redact ?? ((text: string) => defaultRedactor.redactString(text));
   const projectId = safeProjectId(config.projectId);
   const image = resolveMiniStackImage(config.image, config.digest);
-  const platform = config.platform ?? (process.platform === "darwin" && process.arch === "arm64" ? "linux/amd64" : undefined);
+  const discoveredServerPlatform = config.platform === undefined
+    ? await dockerServerPlatform(commands, dependencies.signal)
+    : undefined;
+  const platform = config.platform ?? (isCertifiedMiniStackImage(image)
+    ? CERTIFIED_MINISTACK_PLATFORM
+    : discoveredServerPlatform);
+  if (platform === undefined) throw new Error("could not select a MiniStack container platform");
   const containerName = `anbo-${projectId}-ministack`;
   const networkName = `anbo-${projectId}-control`;
   const runtimeNetworkName = `anbo-${projectId}-runtime`;
@@ -209,7 +229,7 @@ export async function startMiniStack(
     hostPort = await reserveLoopbackPort();
     const args = [
       "run", "--detach", "--name", containerName,
-      ...(platform === undefined ? [] : ["--platform", platform]),
+      "--platform", platform,
       "--label", "anbo.dev/managed=true", "--label", label, "--label", "anbo.dev/component=ministack",
       "--label", `${RUNTIME_CONFIG_LABEL}=${runtimeConfigFingerprint}`,
       "--network", runtimeNetworkName,
@@ -277,6 +297,8 @@ export async function startMiniStack(
           hostEndpoint,
           containerEndpoint: `http://${containerName}:4566`,
           image,
+          platform,
+          ...(discoveredServerPlatform === undefined ? {} : { serverPlatform: discoveredServerPlatform }),
           edition: "full",
         };
       }
@@ -284,11 +306,107 @@ export async function startMiniStack(
         ? `health endpoint reported edition ${String(body["edition"] ?? "unknown")}, expected full`
         : `health endpoint returned HTTP ${response.status}`;
     } catch (error) {
+      rethrowIfAborted(dependencies.signal, error);
       lastFailure = error instanceof Error ? error.message : String(error);
     }
-    await sleep(config.healthIntervalMs ?? 500);
+    const stopped = await stoppedContainerEvidence(
+      commands,
+      containerName,
+      dependencies.signal,
+      redact,
+      platform,
+      discoveredServerPlatform,
+    );
+    if (stopped !== undefined) throw new Error(stopped);
+    await abortableSleep(config.healthIntervalMs ?? 500, sleep, dependencies.signal);
   }
   throw new Error(`MiniStack did not become ready: ${lastFailure}`);
+}
+
+function rethrowIfAborted(signal: AbortSignal | undefined, fallback: unknown): void {
+  if (signal?.aborted === true) throw signal.reason ?? fallback;
+}
+
+async function abortableSleep(
+  milliseconds: number,
+  sleep: (milliseconds: number) => Promise<void>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal === undefined) {
+    await sleep(milliseconds);
+    return;
+  }
+  if (signal.aborted) throw signal.reason;
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => { reject(signal.reason); };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void sleep(milliseconds).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+function isCertifiedMiniStackImage(image: string): boolean {
+  return image.toLowerCase() === CERTIFIED_MINISTACK_IMAGE.toLowerCase();
+}
+
+async function dockerServerPlatform(commands: CommandExecutor, signal?: AbortSignal): Promise<string> {
+  const result = await commands.run(
+    "docker",
+    ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"],
+    signalOptions(signal),
+  );
+  if (result.code !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+    throw new Error(`could not determine Docker server platform: ${detail}`);
+  }
+  const reported = result.stdout.trim().toLowerCase();
+  const aliases: Readonly<Record<string, string>> = {
+    "linux/x86_64": "linux/amd64",
+    "linux/aarch64": "linux/arm64",
+  };
+  const normalized = aliases[reported] ?? reported;
+  if (!/^linux\/(?:amd64|arm64)$/.test(normalized)) {
+    throw new Error(`Docker server reported unsupported platform ${reported || "<empty>"}; MiniStack requires a Linux container server`);
+  }
+  return normalized;
+}
+
+async function stoppedContainerEvidence(
+  commands: CommandExecutor,
+  containerName: string,
+  signal: AbortSignal | undefined,
+  redact: (text: string) => string,
+  selectedPlatform: string,
+  serverPlatform: string | undefined,
+): Promise<string | undefined> {
+  const inspection = await commands.run("docker", ["inspect", containerName], signalOptions(signal));
+  if (inspection.code !== 0) {
+    const detail = inspection.stderr.trim() || inspection.stdout.trim() || `exit code ${inspection.code}`;
+    if (/(?:no such|not found)/i.test(detail)) {
+      return `MiniStack container disappeared before becoming ready: ${redact(detail)}`;
+    }
+    return undefined;
+  }
+  const inspected = parseDockerInspection(inspection.stdout);
+  if (inspected.State?.Running !== false) return undefined;
+
+  const exitCode = inspected.State.ExitCode ?? "unknown";
+  const logs = await commands.run("docker", ["logs", "--tail", "80", containerName], signalOptions(signal));
+  const rawLogs = [logs.stdout, logs.stderr].filter((value) => value.trim().length > 0).join("\n");
+  const evidence = boundedTail(redact(rawLogs || "Docker returned no container logs."), 8_192);
+  const stateError = inspected.State.Error?.trim();
+  return [
+    `MiniStack container exited before becoming ready (exit code ${exitCode}).`,
+    `Container platform: selected=${selectedPlatform}, docker_server=${serverPlatform ?? "not queried (explicit override)"}.`,
+    ...(stateError === undefined || stateError.length === 0 ? [] : [`Docker state: ${redact(stateError)}`]),
+    `Recent container logs:\n${evidence}`,
+  ].join("\n");
+}
+
+function boundedTail(value: string, maximumLength: number): string {
+  if (value.length <= maximumLength) return value;
+  return `[...truncated...]\n${value.slice(-maximumLength)}`;
 }
 
 function hasRuntimeIdentity(containerId: string | undefined, runtimeGeneration: string | undefined): boolean {
@@ -390,7 +508,7 @@ function lambdaContainerFlags(configured: string | undefined): string {
 function parseDockerInspection(value: string): {
   Id?: string;
   Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
-  State?: { Running?: boolean; ExitCode?: number; StartedAt?: string };
+  State?: { Running?: boolean; ExitCode?: number; StartedAt?: string; Error?: string };
   RepoDigests?: string[];
   HostConfig?: {
     PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
@@ -405,7 +523,7 @@ function parseDockerInspection(value: string): {
   return parsed[0] as {
     Id?: string;
     Config?: { Image?: string; Env?: string[]; Labels?: Record<string, string> };
-    State?: { Running?: boolean; ExitCode?: number; StartedAt?: string };
+    State?: { Running?: boolean; ExitCode?: number; StartedAt?: string; Error?: string };
     RepoDigests?: string[];
     HostConfig?: {
       PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
@@ -463,7 +581,7 @@ async function reserveLoopbackPort(): Promise<number> {
 function miniStackRuntimeConfigFingerprint(options: {
   config: MiniStackRuntimeConfig;
   image: string;
-  platform: string | undefined;
+  platform: string;
   projectId: string;
   networkName: string;
   runtimeNetworkName: string;
@@ -497,7 +615,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     version: 1,
     project_id: options.projectId,
     image: options.image,
-    platform: options.platform ?? null,
+    platform: options.platform,
     docker_socket: options.config.dockerSocket ?? "/var/run/docker.sock",
     persistence: options.config.persistence,
     volume_name: options.volumeName ?? null,

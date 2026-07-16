@@ -39,6 +39,19 @@ export interface DynamoDbCloneLease {
 
 export type CloneLease = PostgresCloneLease | DynamoDbCloneLease;
 
+export class AmbiguousCloneCreateError extends Error {
+  readonly branchName: string;
+
+  constructor(engine: CloneEngine, branchName: string, cause: unknown) {
+    super(
+      `${engine} clone create may have succeeded but ownership could not be confirmed: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
+    this.name = "AmbiguousCloneCreateError";
+    this.branchName = branchName;
+  }
+}
+
 const CONTAINER_HOSTNAME = "host.docker.internal";
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "host.docker.internal"]);
 const SECURE_POSTGRES_SSL_MODES = new Set(["require", "verify-ca", "verify-full"]);
@@ -75,6 +88,11 @@ export interface CloneAcquireRequest {
   timeoutMs?: number;
   pollIntervalMs?: number;
   signal?: AbortSignal;
+  /**
+   * Cancels reusable readiness/credential work without interrupting the cloud
+   * create request before its branch ownership can be persisted.
+   */
+  readinessSignal?: AbortSignal;
 }
 
 export interface CloneDependencies {
@@ -133,15 +151,36 @@ export async function acquireConfiguredClones(
   dependencies: CloneDependencies = {},
 ): Promise<Partial<Record<CloneEngine, CloneLease>>> {
   const work: Array<Promise<[CloneEngine, CloneLease]>> = [];
+  const siblingAbort = new AbortController();
+  const readinessSignal = AbortSignal.any([
+    ...(request.signal === undefined ? [] : [request.signal]),
+    ...(request.readinessSignal === undefined ? [] : [request.readinessSignal]),
+    siblingAbort.signal,
+  ]);
+  let hasFailure = false;
+  let firstFailure: unknown;
+  const acquire = (engine: CloneEngine, config: CloneConfig): Promise<[CloneEngine, CloneLease]> =>
+    acquireClone({ ...request, engine, config, readinessSignal }, dependencies)
+      .then((lease): [CloneEngine, CloneLease] => [engine, lease])
+      .catch((cause: unknown) => {
+        if (!hasFailure) {
+          hasFailure = true;
+          firstFailure = cause;
+          siblingAbort.abort(cause);
+        }
+        throw cause;
+      });
   if (request.postgres !== undefined) {
-    work.push(acquireClone({ ...request, engine: "postgres", config: request.postgres }, dependencies)
-      .then((lease) => ["postgres", lease]));
+    work.push(acquire("postgres", request.postgres));
   }
   if (request.dynamodb !== undefined) {
-    work.push(acquireClone({ ...request, engine: "dynamodb", config: request.dynamodb }, dependencies)
-      .then((lease) => ["dynamodb", lease]));
+    work.push(acquire("dynamodb", request.dynamodb));
   }
-  return Object.fromEntries(await Promise.all(work)) as Partial<Record<CloneEngine, CloneLease>>;
+  const settled = await Promise.allSettled(work);
+  if (hasFailure) throw firstFailure;
+  return Object.fromEntries(settled.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : []
+  )) as Partial<Record<CloneEngine, CloneLease>>;
 }
 
 export async function purgeOwnedClones(
@@ -305,10 +344,11 @@ async function acquireCloudClone(
   const state = await readCloneState(request.statePath);
   const existing = state?.clones[request.engine];
   let branch: CloudBranch | undefined;
+  const readinessSignal = request.readinessSignal ?? request.signal;
   if (existing !== undefined && existing.provider === "anbo-cloud" && existing.source === request.config.source &&
       !expiresSoon(existing.expires_at, dependencies.now?.() ?? Date.now())) {
     try {
-      branch = await cloudRequest<CloudBranch>(fetcher, apiUrl, token, "GET", `/v1/branches/${encodeURIComponent(existing.branch_id)}`, undefined, request.signal);
+      branch = await cloudRequest<CloudBranch>(fetcher, apiUrl, token, "GET", `/v1/branches/${encodeURIComponent(existing.branch_id)}`, undefined, readinessSignal);
       assertBranch(branch, request.engine, request.config.source);
       dependencies.onStatus?.("reused", existing);
     } catch {
@@ -316,35 +356,44 @@ async function acquireCloudClone(
     }
   }
   if (branch === undefined) {
+    throwIfAborted(readinessSignal);
     dependencies.onStatus?.("requesting");
-    branch = await cloudRequest<CloudBranch>(fetcher, apiUrl, token, "POST", "/v1/branches", {
-      name: `${safeProjectId(request.projectId)}-${request.engine}`,
-      from: request.config.source,
-      ...(request.config.ttl_seconds === undefined ? {} : { ttl_seconds: request.config.ttl_seconds }),
-    }, request.signal);
-    assertBranch(branch, request.engine, request.config.source);
+    const branchName = `${safeProjectId(request.projectId)}-${request.engine}`;
+    try {
+      branch = await cloudRequest<CloudBranch>(fetcher, apiUrl, token, "POST", "/v1/branches", {
+        name: branchName,
+        from: request.config.source,
+        ...(request.config.ttl_seconds === undefined ? {} : { ttl_seconds: request.config.ttl_seconds }),
+      }, request.signal);
+      assertBranch(branch, request.engine, request.config.source);
+      // Persist ownership before readiness polling. If the caller is cancelled
+      // after the create response, the next run reuses or purges this exact
+      // branch instead of issuing a duplicate create.
+      await updateCloneMetadata(
+        request.statePath,
+        request.projectId,
+        cloudCloneMetadata(request, branch, true),
+      );
+    } catch (cause) {
+      throw new AmbiguousCloneCreateError(request.engine, branchName, cause);
+    }
   }
-  branch = await waitForReady(branch, request, apiUrl, token, fetcher, dependencies);
-  const metadata: CloneMetadata = {
-    engine: request.engine,
-    provider: "anbo-cloud",
-    branch_id: branch.id,
-    branch_name: branch.name,
-    source: request.config.source,
-    ...(branch.source_revision === undefined ? {} : { source_revision: branch.source_revision }),
-    ...(branch.expires_at === undefined ? {} : { expires_at: branch.expires_at }),
-    owned: existing?.branch_id === branch.id ? existing.owned : true,
-  };
+  branch = await waitForReady(branch, request, apiUrl, token, fetcher, dependencies, readinessSignal);
+  const metadata = cloudCloneMetadata(
+    request,
+    branch,
+    existing?.branch_id === branch.id ? existing.owned : true,
+  );
   await updateCloneMetadata(request.statePath, request.projectId, metadata);
   dependencies.onStatus?.("ready", metadata);
   if (request.engine === "postgres") {
-    const value = await cloudRequest<unknown>(fetcher, apiUrl, token, "GET", `/v1/branches/${encodeURIComponent(branch.id)}/url`, undefined, request.signal);
+    const value = await cloudRequest<unknown>(fetcher, apiUrl, token, "GET", `/v1/branches/${encodeURIComponent(branch.id)}/url`, undefined, readinessSignal);
     if (!isRecord(value) || typeof value["database_url"] !== "string") throw new Error("PostgreSQL clone credential response was malformed");
     assertPostgresUrl(value["database_url"]);
     dependencies.registerSecret?.(value["database_url"]);
     return { engine: "postgres", metadata, databaseUrl: value["database_url"] };
   }
-  const value = await cloudRequest<DynamoCredentials>(fetcher, apiUrl, token, "POST", `/v1/branches/${encodeURIComponent(branch.id)}/dynamodb/credentials`, {}, request.signal);
+  const value = await cloudRequest<DynamoCredentials>(fetcher, apiUrl, token, "POST", `/v1/branches/${encodeURIComponent(branch.id)}/dynamodb/credentials`, {}, readinessSignal);
   assertDynamoCredentials(value, branch, dependencies.now?.() ?? Date.now());
   dependencies.registerSecret?.(value.endpoint_url);
   dependencies.registerSecret?.(value.access_key_id);
@@ -364,6 +413,23 @@ async function acquireCloudClone(
   };
 }
 
+function cloudCloneMetadata(
+  request: CloneAcquireRequest,
+  branch: CloudBranch,
+  owned: boolean,
+): CloneMetadata {
+  return {
+    engine: request.engine,
+    provider: "anbo-cloud",
+    branch_id: branch.id,
+    branch_name: branch.name,
+    ...(request.config.source === undefined ? {} : { source: request.config.source }),
+    ...(branch.source_revision === undefined ? {} : { source_revision: branch.source_revision }),
+    ...(branch.expires_at === undefined ? {} : { expires_at: branch.expires_at }),
+    owned,
+  };
+}
+
 async function waitForReady(
   initial: CloudBranch,
   request: CloneAcquireRequest,
@@ -371,22 +437,52 @@ async function waitForReady(
   token: string,
   fetcher: typeof globalThis.fetch,
   dependencies: CloneDependencies,
+  signal?: AbortSignal,
 ): Promise<CloudBranch> {
   let branch = initial;
   const now = dependencies.now ?? Date.now;
   const sleep = dependencies.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const deadline = now() + (request.timeoutMs ?? 600_000);
   while (!branch.ready) {
+    throwIfAborted(signal);
     if (["failed", "deleted", "deleting"].includes(branch.status)) {
       throw new Error(`clone branch ${branch.id} reached terminal status ${branch.status}`);
     }
     if (now() >= deadline) throw new Error(`timed out waiting for clone branch ${branch.id}; last status ${branch.status}`);
     dependencies.onStatus?.(branch.status);
-    await sleep(request.pollIntervalMs ?? 2_000);
-    branch = await cloudRequest<CloudBranch>(fetcher, apiUrl, token, "GET", `/v1/branches/${encodeURIComponent(branch.id)}`, undefined, request.signal);
+    await abortableSleep(sleep, request.pollIntervalMs ?? 2_000, signal);
+    branch = await cloudRequest<CloudBranch>(fetcher, apiUrl, token, "GET", `/v1/branches/${encodeURIComponent(branch.id)}`, undefined, signal);
     assertBranch(branch, request.engine, request.config.source ?? "");
   }
   return branch;
+}
+
+async function abortableSleep(
+  sleep: (milliseconds: number) => Promise<void>,
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
+  if (signal === undefined) {
+    await sleep(milliseconds);
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", abort, { once: true });
+    void sleep(milliseconds).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted !== true) return;
+  throw abortReason(signal);
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
 }
 
 async function updateCloneMetadata(path: string, projectId: string, metadata: CloneMetadata): Promise<void> {

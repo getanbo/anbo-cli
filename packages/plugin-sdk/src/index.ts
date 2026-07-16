@@ -10,6 +10,8 @@ export const TARGET_ACTIONS = [
   "test",
   "logs",
   "debug",
+  "run",
+  "reset",
   "down",
   "capabilities",
   "cache",
@@ -72,6 +74,10 @@ export interface ProcessRunOptionsV1 {
   input?: string;
   timeout_ms?: number;
   allow_failure?: boolean;
+  /** Optional operation-local cancellation composed with the plugin host signal. */
+  signal?: AbortSignal;
+  /** Delivers stdout/stderr chunks while the child is still running. */
+  on_output?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
 }
 
 export interface ProcessRunResultV1 {
@@ -107,6 +113,16 @@ export interface PluginContextV1 {
       args: readonly string[],
       options?: ProcessRunOptionsV1,
     ): Promise<ProcessRunResultV1>;
+    /**
+     * Runs a bounded teardown command without inheriting an already-aborted
+     * operation signal. This is only for releasing resources created by a
+     * plugin; ordinary work must use run().
+     */
+    cleanup?(
+      command: string,
+      args: readonly string[],
+      options?: Omit<ProcessRunOptionsV1, "signal">,
+    ): Promise<ProcessRunResultV1>;
   };
   http: { request(input: string | URL, init?: RequestInit): Promise<Response> };
   state: PluginStateV1;
@@ -118,6 +134,8 @@ export interface PluginContextV1 {
 
 export interface TargetRequestV1 {
   api_version: 1;
+  /** Canonical host run ID. Plugins must not replace it with a user flag. */
+  run_id?: string;
   action: TargetActionV1;
   project: { root: string; logical_id: string; runtime_id: string };
   config: unknown;
@@ -130,6 +148,16 @@ export interface PluginDiagnosticV1 {
   code: string;
   message: string;
   remediation?: string;
+  level?: EventLevel;
+  phase?: string;
+  retryable?: boolean;
+  safe_to_retry?: boolean;
+  evidence?: unknown;
+}
+
+/** Canonical failure returned by a plugin target to the CLI host. */
+export interface PluginFailureV1 extends PluginDiagnosticV1 {
+  exit_code: number;
 }
 
 export interface TargetResultV1 {
@@ -137,6 +165,7 @@ export interface TargetResultV1 {
   ok?: boolean;
   data?: unknown;
   diagnostics?: PluginDiagnosticV1[];
+  failure?: PluginFailureV1;
 }
 
 export interface TargetProviderV1 {
@@ -147,6 +176,7 @@ export interface TargetProviderV1 {
 export interface PluginCommandRequestV1 {
   name: string;
   command: string;
+  run_id?: string;
   project: TargetRequestV1["project"];
   config: unknown;
   args: readonly string[];

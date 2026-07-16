@@ -25,6 +25,7 @@ const SECRET_VALUES = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?):\/\/[^\s/@:]+:[^\s/@]+@/i,
 ];
+const AWS_RESOURCE_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):[a-z0-9-]+:[a-z0-9-]*:\d{0,12}:.+$/i;
 
 export interface LockMetadata {
   schema_version: 1;
@@ -208,7 +209,8 @@ export function assertSecretFree(value: unknown): void {
     for (const [key, item] of Object.entries(current)) {
       const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
       const isReference = typeof item === "string" && (item.startsWith("env://") || item.startsWith("exec://"));
-      if (SECRET_KEY.test(normalizedKey) && item !== undefined && item !== null && !isReference) {
+      const isResourceIdentifier = typeof item === "string" && AWS_RESOURCE_ARN.test(item);
+      if (SECRET_KEY.test(normalizedKey) && item !== undefined && item !== null && !isReference && !isResourceIdentifier) {
         secretPaths.push(`${path}.${key}`);
       } else {
         visit(item, `${path}.${key}`);

@@ -10,6 +10,14 @@ This package deliberately has no executable. Install and invoke only `anbo`.
 
 ## Install
 
+For a machine-wide agent toolchain with a direct `anbo` executable:
+
+```bash
+npm install --global anbo@0.2.0 @getanbo/plugin-ministack@0.1.0
+```
+
+For a project-pinned toolchain that is reproducible in CI:
+
 ```bash
 npm install --save-dev --save-exact anbo@0.2.0 @getanbo/plugin-ministack@0.1.0
 ```
@@ -54,6 +62,10 @@ default MiniStack target. New automation should use `anbo deploy`.
 - Dockerfiles and project-relative build contexts.
 
 It does not modify application code, call an AI model, or infer secrets.
+If configuration happened before Terraform or Dockerfiles existed, the first
+deploy replaces only the generated empty-project placeholder. Run
+`anbo configure --target ministack --refresh` to merge later-discovered roots
+and builds while preserving configured services, tests, clones, and adapters.
 
 ## Data Clones
 
@@ -98,10 +110,29 @@ credentials:
 
 ## Builds And Tests
 
-Build fingerprints cover declared configuration and inputs. A matching local
+Build fingerprints cover declared configuration. Command builds honor declared
+inputs; Docker context fingerprints cover the complete context after
+`.dockerignore` filtering (including Dockerfile-specific ignore files) and
+include entry type, symbolic-link target, and permission mode. A matching local
 artifact is reused rather than rebuilt. Terraform provider plugins, private
 workspaces, Docker BuildKit cache, MiniStack persistence, and clone metadata are
 stored under the CLI-provided namespaced state and cache paths.
+
+Terraform source fingerprints remain content-based, but the plugin keeps a
+private per-project, per-root digest cache outside the source tree. An unchanged
+warm deploy reads file metadata without rereading every file body; a metadata
+change rehashes only that file, and a touch with identical bytes does not change
+the reconciliation fingerprint. Cache files are replaced atomically with private
+permissions, and a missing or malformed cache falls back to a full content scan.
+
+MiniStack startup, clone acquisition, and declared image builds run concurrently.
+Cancellable readiness, build, and runtime work stops on the first real failure;
+an in-flight cloud clone create is allowed to return just long enough to persist
+branch ownership before its remaining readiness work is cancelled. Docker Buildx is used when
+available; otherwise the plugin falls back to the classic Docker builder rather
+than failing setup. The certified runtime platform is explicit and recorded in
+structured phase output, so host architecture heuristics cannot silently change
+the deployed runtime.
 
 A normal deploy skips a Terraform root only when its owned inputs, saved state
 metadata, filtered outputs, and the exact healthy MiniStack container process
@@ -112,10 +143,24 @@ privately caches init-augmented provider checksums by project, root, source lock
 and worker identity; it never modifies the source lock or invents one for a
 lockless project.
 
+Each reconciled Terraform root uses one short-lived worker container for init,
+validate, plan, show, apply, and output. The worker has normal egress only for
+provider initialization, then moves to the isolated MiniStack control network;
+apply still consumes the exact saved plan. Unchanged, healthy application
+containers are reused. A changed service restarts only its dependent branch,
+and test-only runs reuse runtime-bound services when their resolved bindings are
+unchanged.
+
 Smoke tests are declared in `.anbo/sandbox.json` and execute only through
 `anbo test` or the deploy lifecycle. Tests may emit the `jsonl-v1` protocol;
 the plugin promotes assertions and progress into the canonical ordered event
 stream while retaining process output for debugging.
+
+Failures return one canonical diagnostic with a stable code, exact exit code,
+phase, retryability, remediation, and any safe evidence. `anbo logs` and
+`anbo debug` can inspect labelled containers even when startup never reached a
+ready state; debug output includes bounded, redacted container state and log
+tails for the failed run.
 
 ## MiniStack Coverage
 
@@ -142,10 +187,10 @@ return typed bindings and diagnostics. See [Adapter protocol v2](docs/adapters-v
 
 [`runtime-manifest.json`](runtime-manifest.json) is the single audited runtime
 pin. It records the upstream MiniStack commit, the downstream Anbo MiniStack
-build commit, and the exact multi-platform image index certified by the
-installed-CLI acceptance suite. The configured runtime is always the immutable
-`ghcr.io/getanbo/anbo-ministack@sha256:...` reference; mutable tags are never
-accepted as the release pin.
+build commit, the exact multi-platform image index, and the image platform
+certified by the installed-CLI acceptance suite. The configured runtime is
+always the immutable `ghcr.io/getanbo/anbo-ministack@sha256:...` reference;
+mutable tags are never accepted as the release pin.
 
 ## Development
 

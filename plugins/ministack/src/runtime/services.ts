@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { AnboError, ExitCode, type ServiceConfig, type TestConfig } from "../types.js";
 import type { AdapterBinding } from "../adapters.js";
 import type { BuildResult } from "./cache.js";
@@ -37,6 +38,21 @@ export interface RefreshedServices {
   restarted: string[];
 }
 
+interface ReconciledService {
+  running: RunningService;
+  restarted: boolean;
+  healthVerified: boolean;
+}
+
+interface ServiceInspection {
+  running: boolean;
+  reusable: boolean;
+  fingerprint?: string;
+}
+
+const SERVICE_FINGERPRINT_LABEL = "anbo.dev/service-fingerprint";
+const SERVICE_FINGERPRINT_VERSION = 1;
+
 export async function ensureApplicationNetwork(
   projectIdValue: string,
   miniStackContainer: string,
@@ -67,6 +83,7 @@ export async function startDeclaredServices(
 ): Promise<Record<string, RunningService>> {
   const commands = dependencies.commands ?? new ProcessCommandExecutor();
   const running: Record<string, RunningService> = {};
+  const restarted = new Set<string>();
   const pending = new Set(Object.keys(services));
   while (pending.size > 0) {
     const ready = [...pending].filter((name) => (services[name]?.depends_on ?? []).every((dependency) => dependency in running));
@@ -74,9 +91,20 @@ export async function startDeclaredServices(
     await Promise.all(ready.map(async (name) => {
       const config = services[name];
       if (config === undefined) return;
-      dependencies.onStatus?.(name, "starting");
-      running[name] = await startService(name, config, context, commands);
-      await waitForServiceHealth(running[name]!, config, context, commands, dependencies.fetch, dependencies.sleep);
+      const result = await reconcileService(
+        name,
+        config,
+        context,
+        commands,
+        (config.depends_on ?? []).some((dependency) => restarted.has(dependency)),
+        dependencies.fetch,
+      );
+      dependencies.onStatus?.(name, result.restarted ? "starting" : "reusing");
+      running[name] = result.running;
+      if (result.restarted) restarted.add(name);
+      if (!result.healthVerified) {
+        await waitForServiceHealth(running[name]!, config, context, commands, dependencies.fetch, dependencies.sleep);
+      }
       dependencies.onStatus?.(name, "ready");
       pending.delete(name);
     }));
@@ -102,8 +130,10 @@ export async function refreshRuntimeBoundServices(
 ): Promise<RefreshedServices> {
   const commands = dependencies.commands ?? new ProcessCommandExecutor();
   const running: Record<string, RunningService> = { ...existing };
-  const pending = new Set(runtimeBoundServiceNames(services));
+  const directlyRefreshable = new Set(runtimeBoundServiceNames(services));
+  const pending = new Set(Object.keys(services));
   const restarted: string[] = [];
+  const restartedSet = new Set<string>();
 
   while (pending.size > 0) {
     const ready = [...pending].filter((name) => (services[name]?.depends_on ?? []).every(
@@ -116,14 +146,31 @@ export async function refreshRuntimeBoundServices(
       const config = services[name];
       const deployed = existing[name];
       if (config === undefined) return;
-      if (deployed === undefined) {
-        throw new Error(`service ${name} has mutable runtime bindings but no deployed image; run anbo deploy first`);
+      const dependencyRestarted = (config.depends_on ?? []).some((dependency) => restartedSet.has(dependency));
+      if (!directlyRefreshable.has(name) && !dependencyRestarted) {
+        pending.delete(name);
+        return;
       }
-      dependencies.onStatus?.(name, "refreshing");
-      running[name] = await startService(name, config, context, commands, deployed.image);
-      await waitForServiceHealth(running[name]!, config, context, commands, dependencies.fetch, dependencies.sleep);
+      if (deployed === undefined) throw new Error(`service ${name} needs refresh but has no deployed image; run anbo deploy first`);
+      const result = await reconcileService(
+        name,
+        config,
+        context,
+        commands,
+        dependencyRestarted,
+        dependencies.fetch,
+        deployed.image,
+      );
+      dependencies.onStatus?.(name, result.restarted ? "refreshing" : "reusing");
+      running[name] = result.running;
+      if (!result.healthVerified) {
+        await waitForServiceHealth(running[name]!, config, context, commands, dependencies.fetch, dependencies.sleep);
+      }
       dependencies.onStatus?.(name, "ready");
-      restarted.push(name);
+      if (result.restarted) {
+        restarted.push(name);
+        restartedSet.add(name);
+      }
       pending.delete(name);
     }));
   }
@@ -276,18 +323,62 @@ export function resolveServiceEnvironment(
   return result;
 }
 
-async function startService(
+async function reconcileService(
   name: string,
   config: ServiceConfig,
   context: ServiceRuntimeContext,
   commands: CommandExecutor,
+  forceRestart: boolean,
+  fetcher: typeof globalThis.fetch = globalThis.fetch,
   persistedImage?: string,
-): Promise<RunningService> {
+): Promise<ReconciledService> {
   const projectId = safeProjectId(context.projectId);
   const containerName = `anbo-${projectId}-${safeProjectId(name)}`;
   const image = persistedImage ?? config.image ?? (config.build === undefined ? undefined : context.builds[config.build]?.image);
   if (image === undefined) throw new Error(`service ${name} must specify image or build`);
-  await commands.run("docker", ["rm", "-f", containerName]);
+  const environment = resolveRuntimeEnvironment(name, config, context);
+  const imageIdentity = await resolveImageIdentity(image, commands);
+  const fingerprintEnvironment = Object.fromEntries(
+    Object.entries(environment).filter(([key]) => key !== "ANBO_RUN_ID"),
+  );
+  const fingerprint = serviceFingerprint(config, context.networkName, imageIdentity, fingerprintEnvironment);
+  const inspection = await inspectService(containerName, commands);
+  if (!forceRestart && inspection?.reusable === true && inspection.fingerprint === fingerprint) {
+    const reused = await runningService(name, containerName, image, config, commands);
+    if (await probeServiceHealth(reused, config, context, commands, fetcher)) {
+      return { running: reused, restarted: false, healthVerified: true };
+    }
+  }
+  throwIfServiceCancelled(context.signal);
+  if (inspection !== undefined) {
+    throwIfServiceCancelled(context.signal);
+    const removed = await commands.run(
+      "docker",
+      ["rm", "-f", containerName],
+      context.signal === undefined ? {} : { signal: context.signal },
+    );
+    if (removed.code !== 0) throw new Error(`service ${name} could not replace its container: ${removed.stderr.trim()}`);
+  }
+  throwIfServiceCancelled(context.signal);
+  const args = [
+    "run", "--detach", "--name", containerName,
+    "--label", "anbo.dev/managed=true", "--label", `anbo.dev/project=${projectId}`, "--label", "anbo.dev/component=service",
+    "--label", `${SERVICE_FINGERPRINT_LABEL}=${fingerprint}`,
+    "--network", context.networkName,
+    "--add-host", "host.docker.internal:host-gateway",
+    ...Object.entries(environment).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
+    ...(config.working_directory === undefined ? [] : ["--workdir", config.working_directory]),
+    ...(config.ports ?? []).flatMap((port) => ["--publish", `127.0.0.1:${port.host ?? ""}:${port.container}/${port.protocol ?? "tcp"}`]),
+    image,
+    ...(config.command ?? []),
+  ];
+  const commandOptions = context.signal === undefined ? {} : { signal: context.signal };
+  const started = await commands.run("docker", args, commandOptions);
+  if (started.code !== 0) throw new Error(`service ${name} failed to start: ${started.stderr.trim()}`);
+  return { running: await runningService(name, containerName, image, config, commands), restarted: true, healthVerified: false };
+}
+
+function resolveRuntimeEnvironment(name: string, config: ServiceConfig, context: ServiceRuntimeContext): Record<string, string> {
   const environment = resolveServiceEnvironment(config.environment ?? {}, context);
   if (config.dynamodb_plane === "clone") {
     const lease = context.clones.dynamodb;
@@ -304,20 +395,16 @@ async function startService(
     environment["ANBO_DYNAMODB_CLONE_SECRET_ACCESS_KEY"] = lease.secretAccessKey;
     environment["ANBO_DYNAMODB_CLONE_SESSION_TOKEN"] = lease.sessionToken;
   }
-  const args = [
-    "run", "--detach", "--name", containerName,
-    "--label", "anbo.dev/managed=true", "--label", `anbo.dev/project=${projectId}`, "--label", "anbo.dev/component=service",
-    "--network", context.networkName,
-    "--add-host", "host.docker.internal:host-gateway",
-    ...Object.entries(environment).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
-    ...(config.working_directory === undefined ? [] : ["--workdir", config.working_directory]),
-    ...(config.ports ?? []).flatMap((port) => ["--publish", `127.0.0.1:${port.host ?? ""}:${port.container}/${port.protocol ?? "tcp"}`]),
-    image,
-    ...(config.command ?? []),
-  ];
-  const commandOptions = context.signal === undefined ? {} : { signal: context.signal };
-  const started = await commands.run("docker", args, commandOptions);
-  if (started.code !== 0) throw new Error(`service ${name} failed to start: ${started.stderr.trim()}`);
+  return environment;
+}
+
+async function runningService(
+  name: string,
+  containerName: string,
+  image: string,
+  config: ServiceConfig,
+  commands: CommandExecutor,
+): Promise<RunningService> {
   const ports: Record<number, number> = {};
   for (const port of config.ports ?? []) {
     const output = await commands.run("docker", ["port", containerName, `${port.container}/${port.protocol ?? "tcp"}`]);
@@ -325,6 +412,112 @@ async function startService(
     if (match?.[1] !== undefined) ports[port.container] = Number(match[1]);
   }
   return { name, containerName, image, ports };
+}
+
+async function resolveImageIdentity(
+  image: string,
+  commands: CommandExecutor,
+): Promise<string> {
+  const digest = image.match(/@sha256:([a-f0-9]{64})$/i)?.[1];
+  if (digest !== undefined) return `digest:${digest.toLowerCase()}`;
+  const inspected = await commands.run("docker", ["image", "inspect", "--format", "{{.Id}}", image]);
+  const identity = inspected.code === 0 ? inspected.stdout.trim() : "";
+  return identity.length > 0 ? `image:${identity}` : `reference:${image}`;
+}
+
+function serviceFingerprint(
+  config: ServiceConfig,
+  networkName: string,
+  imageIdentity: string,
+  environment: Readonly<Record<string, string>>,
+): string {
+  return createHash("sha256").update(stableJson({
+    version: SERVICE_FINGERPRINT_VERSION,
+    image: imageIdentity,
+    network: networkName,
+    command: config.command ?? [],
+    working_directory: config.working_directory ?? null,
+    environment,
+    ports: config.ports ?? [],
+    depends_on: config.depends_on ?? [],
+    healthcheck: config.healthcheck ?? null,
+    dynamodb_plane: config.dynamodb_plane ?? "ministack",
+  })).digest("hex");
+}
+
+async function inspectService(containerName: string, commands: CommandExecutor): Promise<ServiceInspection | undefined> {
+  const result = await commands.run("docker", ["inspect", containerName]);
+  if (result.code !== 0) {
+    const evidence = result.stderr.trim() || result.stdout.trim();
+    if (/(?:no such|not found)/i.test(evidence)) return undefined;
+    throw new Error(`could not inspect service container ${containerName}: ${evidence || `exit code ${result.code}`}`);
+  }
+  try {
+    const parsed = JSON.parse(result.stdout) as unknown;
+    const value = Array.isArray(parsed) ? parsed[0] : undefined;
+    if (!isRecord(value)) return { running: false, reusable: false };
+    const state = isRecord(value["State"]) ? value["State"] : undefined;
+    const config = value["Config"];
+    const labels = isRecord(config) && isRecord(config["Labels"]) ? config["Labels"] : undefined;
+    const fingerprint = labels?.[SERVICE_FINGERPRINT_LABEL];
+    const running = state?.["Running"] === true;
+    const status = typeof state?.["Status"] === "string" ? state["Status"] : undefined;
+    const health = isRecord(state?.["Health"]) && typeof state["Health"]["Status"] === "string"
+      ? state["Health"]["Status"]
+      : undefined;
+    const reusable = running
+      && state?.["Paused"] !== true
+      && state?.["Restarting"] !== true
+      && state?.["Dead"] !== true
+      && (status === undefined || status === "running")
+      && (health === undefined || health === "healthy");
+    return {
+      running,
+      reusable,
+      ...(typeof fingerprint === "string" ? { fingerprint } : {}),
+    };
+  } catch {
+    return { running: false, reusable: false };
+  }
+}
+
+async function probeServiceHealth(
+  service: RunningService,
+  config: ServiceConfig,
+  context: ServiceRuntimeContext,
+  commands: CommandExecutor,
+  fetcher: typeof globalThis.fetch,
+): Promise<boolean> {
+  const health = config.healthcheck;
+  if (health === undefined) return true;
+  try {
+    if (health.type === "http") {
+      return (await fetcher(resolveEnvironmentValue(health.url, context), { signal: context.signal })).ok;
+    }
+    if (health.type === "command") {
+      return (await commands.run(
+        "docker",
+        ["exec", service.containerName, ...health.command],
+        context.signal === undefined ? {} : { signal: context.signal },
+      )).code === 0;
+    }
+    return service.ports[health.port] !== undefined;
+  } catch {
+    throwIfServiceCancelled(context.signal);
+    return false;
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function waitForServiceHealth(
@@ -342,6 +535,7 @@ async function waitForServiceHealth(
   const deadline = Date.now() + timeout * 1_000;
   let last = "not ready";
   while (Date.now() < deadline) {
+    throwIfServiceCancelled(context.signal);
     try {
       if (health.type === "http") {
         const url = resolveEnvironmentValue(health.url, context);
@@ -349,17 +543,47 @@ async function waitForServiceHealth(
         if (response.ok) return;
         last = `HTTP ${response.status}`;
       } else if (health.type === "command") {
-        const result = await commands.run("docker", ["exec", service.containerName, ...health.command]);
+        const result = await commands.run(
+          "docker",
+          ["exec", service.containerName, ...health.command],
+          context.signal === undefined ? {} : { signal: context.signal },
+        );
         if (result.code === 0) return;
         last = result.stderr.trim() || `exit ${result.code}`;
       } else {
         const port = service.ports[health.port];
         if (port !== undefined) return; // Docker has successfully bound the requested TCP listener.
       }
-    } catch (error) { last = error instanceof Error ? error.message : String(error); }
-    await sleep(interval);
+    } catch (error) {
+      throwIfServiceCancelled(context.signal, error);
+      last = error instanceof Error ? error.message : String(error);
+    }
+    await abortableServiceSleep(interval, sleep, context.signal);
   }
   throw new Error(`service ${service.name} health check failed: ${last}`);
+}
+
+function throwIfServiceCancelled(signal: AbortSignal | undefined, fallback?: unknown): void {
+  if (signal?.aborted === true) {
+    throw signal.reason ?? fallback ?? new DOMException("The operation was aborted", "AbortError");
+  }
+}
+
+async function abortableServiceSleep(
+  milliseconds: number,
+  sleep: (milliseconds: number) => Promise<void>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal === undefined) {
+    await sleep(milliseconds);
+    return;
+  }
+  throwIfServiceCancelled(signal);
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void sleep(milliseconds).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 function resolveEnvironmentValue(value: string, context: ServiceRuntimeContext): string {
