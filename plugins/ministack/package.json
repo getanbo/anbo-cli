@@ -72,7 +72,7 @@
   "devDependencies": {
     "@getanbo/plugin-sdk": "0.2.0",
     "@types/node": "^22.10.0",
-    "typescript": "^5.7.2"
+    "typescript": "^7.0.2"
   },
   "license": "MIT",
   "dependencies": {
