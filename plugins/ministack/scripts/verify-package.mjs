@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 const root = new URL("../", import.meta.url);
 const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const descriptor = JSON.parse(await readFile(new URL("../anbo.plugin.json", import.meta.url), "utf8"));
+const runtime = JSON.parse(await readFile(new URL("../runtime-manifest.json", import.meta.url), "utf8"));
 
 assert.equal(pkg.name, "@getanbo/plugin-ministack");
 assert.equal(pkg.bin, undefined, "plugins must not declare an anbo binary");
@@ -12,6 +13,10 @@ assert.equal(descriptor.id, "anbo.ministack");
 assert.equal(descriptor.version, pkg.version);
 assert.equal(descriptor.entrypoint, "./dist/src/plugin.js");
 assert.equal(pkg.peerDependencies["@getanbo/plugin-sdk"], ">=0.2.0 <0.3.0");
+assert.deepEqual(runtime.platforms, ["linux/amd64", "linux/arm64"]);
+assert.equal(runtime.compatibility["linux/arm64"].environment.OPENSSL_armcap, "0");
+assert.equal(runtime.compatibility["linux/arm64"].certification, "native-full-ed25519-asyncssh-kms-v1");
+assert.equal(runtime.certified_image, `ministackorg/ministack@${runtime.digest}`);
 
 const packed = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
   cwd: root,

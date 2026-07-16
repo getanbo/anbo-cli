@@ -1,4 +1,4 @@
-name: Promote Anbo MiniStack runtime pin
+name: Promote MiniStack runtime pin
 
 on:
   workflow_dispatch:
@@ -9,11 +9,8 @@ on:
       upstream_sha:
         description: Exact upstream MiniStack commit
         required: true
-      downstream_sha:
-        description: Exact getanbo/anbo-ministack source commit
-        required: true
-      distribution_version:
-        description: Candidate or release distribution version
+      upstream_version:
+        description: Exact upstream MiniStack release version
         required: true
 
 permissions:
@@ -32,18 +29,18 @@ jobs:
         env:
           ANBO_MINISTACK_DIGEST: ${{ inputs.digest }}
           ANBO_MINISTACK_UPSTREAM_SHA: ${{ inputs.upstream_sha }}
-          ANBO_MINISTACK_DOWNSTREAM_SHA: ${{ inputs.downstream_sha }}
-          ANBO_MINISTACK_VERSION: ${{ inputs.distribution_version }}
+          ANBO_MINISTACK_VERSION: ${{ inputs.upstream_version }}
+          ANBO_MINISTACK_PLATFORMS: linux/amd64,linux/arm64
         run: node plugins/ministack/scripts/update-runtime-pin.mjs
       - name: Open digest bump pull request
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          branch="sync/anbo-ministack-${{ inputs.downstream_sha }}"
+          branch="sync/ministack-${{ inputs.upstream_sha }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add plugins/ministack/runtime-manifest.json plugins/ministack/fixtures/terraform-smoke/.anbo/sandbox.json
-          git commit -m "chore: promote Anbo MiniStack runtime digest"
+          git commit -m "chore: promote MiniStack runtime digest"
           git push --set-upstream origin "$branch"
-          gh pr create --title "chore: promote Anbo MiniStack runtime digest" --body "Pins the candidate image and index digest. Merge is gated on installed-CLI acceptance; the tested image must not be rebuilt." --base main --head "$branch"
+          gh pr create --title "chore: promote MiniStack runtime digest" --body "Pins the exact upstream source and multi-platform index digest. Merge is gated on installed-CLI acceptance." --base main --head "$branch"

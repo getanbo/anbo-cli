@@ -219,8 +219,8 @@ function eventSink(output: string[] = []): PluginEventSink {
 
 test("MiniStack accepts only digest-pinned full images", () => {
   const digest = `sha256:${"a".repeat(64)}`;
-  const certifiedDigest = "sha256:cf29ce9cacd3982531b5f5bd48a7b46c10acaf4f44a10fb25831b3073c26b204";
-  const certifiedImage = `ghcr.io/getanbo/anbo-ministack@${certifiedDigest}`;
+  const certifiedDigest = "sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9";
+  const certifiedImage = `ministackorg/ministack@${certifiedDigest}`;
   assert.equal(resolveMiniStackImage(certifiedImage, certifiedDigest), certifiedImage);
   assert.equal(
     resolveMiniStackImage("ministackorg/ministack:1.4.2-full", digest),
@@ -248,7 +248,6 @@ test("MiniStack separates the egress runtime network from the internal Terraform
     digest: `sha256:${"a".repeat(64)}`,
     persistence: false,
     stateRoot: "/tmp/unused",
-    platform: "linux/amd64",
   }, {
     commands: executor,
     fetch: async () => Response.json({ edition: "full" }),
@@ -278,7 +277,6 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
     digest,
     persistence: false,
     stateRoot: "/tmp/unused",
-    platform: "linux/amd64",
     environment: { Z_FLAG: "last", OPENSEARCH_DATAPLANE: "0" },
   };
   let initialCreated = false;

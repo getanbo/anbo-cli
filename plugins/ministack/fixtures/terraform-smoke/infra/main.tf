@@ -52,6 +52,10 @@ resource "aws_lambda_function" "smoke" {
   source_code_hash = filebase64sha256("dist/smoke.zip")
 }
 
+resource "aws_kms_key" "smoke" {
+  description = "Anbo MiniStack acceptance key"
+}
+
 output "bucket" {
   value = aws_s3_bucket.smoke.bucket
 }
@@ -66,4 +70,8 @@ output "table" {
 
 output "function_name" {
   value = aws_lambda_function.smoke.function_name
+}
+
+output "kms_key_id" {
+  value = aws_kms_key.smoke.key_id
 }
