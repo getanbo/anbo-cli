@@ -14,6 +14,7 @@ if (requested) assert.equal(requested, pkg.version, "requested release must matc
 assert.equal(descriptor.version, pkg.version, "descriptor and package versions must match");
 assert.equal(runtime.source, "anbo-ministack", "release is blocked until the bootstrap pin is promoted to an Anbo MiniStack candidate");
 assert.match(runtime.digest, /^sha256:[a-f0-9]{64}$/);
+assert.match(runtime.platform, /^linux\/(?:amd64|arm64)$/);
 assert.equal(runtime.certified_image, `ghcr.io/getanbo/anbo-ministack@${runtime.digest}`);
 assert.match(runtime.upstream.commit, /^[a-f0-9]{40}$/);
 assert.match(runtime.downstream.commit, /^[a-f0-9]{40}$/);

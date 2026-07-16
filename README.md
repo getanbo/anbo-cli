@@ -23,7 +23,7 @@ anbo version
 After publication:
 
 ```sh
-npm install --global anbo
+npm install --global anbo @getanbo/plugin-ministack
 ```
 
 ## MiniStack Project
@@ -38,8 +38,14 @@ anbo status --output jsonl
 anbo test --output jsonl -- npm test
 anbo logs --follow --output jsonl
 anbo debug --output jsonl
+anbo run --output jsonl -- node -e 'console.log("ready")'
+anbo reset --no-test --output jsonl
 anbo down --purge --output jsonl
 ```
+
+If Terraform or Dockerfiles are added after the initial configuration, run
+`anbo configure --target ministack --refresh`. Deploy also repairs the generated
+empty-project placeholder automatically without replacing user configuration.
 
 `anbo sandbox up` remains an alias for `anbo deploy --target ministack`.
 

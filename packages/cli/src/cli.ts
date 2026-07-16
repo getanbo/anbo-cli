@@ -12,6 +12,7 @@ import {
 } from "./constants.js";
 import { AnboError, UsageError } from "./errors.js";
 import { EventWriter } from "./events.js";
+import { safeJsonObject, safeJsonValue } from "./json.js";
 import {
   executePluginCommand,
   executeTarget,
@@ -85,6 +86,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       data: {
         code: normalized.code,
         ...(normalized.hint ? { remediation: normalized.hint } : {}),
+        ...(normalized.metadata?.phase ? { phase: normalized.metadata.phase } : {}),
+        ...(normalized.metadata?.retryable === undefined ? {} : { retryable: normalized.metadata.retryable }),
+        ...(normalized.metadata?.safe_to_retry === undefined ? {} : { safe_to_retry: normalized.metadata.safe_to_retry }),
+        ...(normalized.metadata?.evidence === undefined ? {} : { evidence: safeJsonValue(normalized.metadata.evidence) }),
       },
     });
   } finally {
@@ -200,14 +205,44 @@ async function dispatch(
     });
   }
   if (result.status === "cancelled") {
-    throw new AnboError("Plugin operation was cancelled.", "ANBO_CANCELLED", EXIT_CODE.cancelled);
+    const failure = result.failure;
+    throw new AnboError(
+      failure?.message ?? "Plugin operation was cancelled.",
+      failure?.code ?? "ANBO_CANCELLED",
+      EXIT_CODE.cancelled,
+      failure?.remediation,
+      pluginFailureMetadata(failure),
+    );
   }
   if (result.status === "failed") {
-    throw new AnboError("Plugin operation failed.", "ANBO_PLUGIN_OPERATION_FAILED");
+    const failure = result.failure ?? result.diagnostics?.[0];
+    throw new AnboError(
+      failure?.message ?? "Plugin operation failed.",
+      failure?.code ?? "ANBO_PLUGIN_OPERATION_FAILED",
+      pluginFailureExitCode(result.failure?.exit_code),
+      failure?.remediation,
+      pluginFailureMetadata(failure),
+    );
   }
   if (isConfigure || isLegacy) {
     await lockLoadedPlugin({ rootDir, target, lock: files.lock, loaded });
   }
+}
+
+function pluginFailureExitCode(value: number | undefined): number {
+  return Number.isSafeInteger(value) && value !== undefined && value > 0 && value <= 255 && value !== EXIT_CODE.cancelled
+    ? value
+    : EXIT_CODE.operationFailed;
+}
+
+function pluginFailureMetadata(failure: TargetResultV1["failure"] | NonNullable<TargetResultV1["diagnostics"]>[number] | undefined) {
+  if (failure === undefined) return undefined;
+  return {
+    ...(failure.phase === undefined ? {} : { phase: failure.phase }),
+    ...(failure.retryable === undefined ? {} : { retryable: failure.retryable }),
+    ...(failure.safe_to_retry === undefined ? {} : { safe_to_retry: failure.safe_to_retry }),
+    ...(failure.evidence === undefined ? {} : { evidence: failure.evidence }),
+  };
 }
 
 async function runPluginCommand(
@@ -343,6 +378,7 @@ function routePluginCommand(parsed: ParsedCliArgs): {
 }
 
 function normalizeError(error: unknown, aborted: boolean): AnboError {
+  if (error instanceof AnboError && error.exitCode === EXIT_CODE.cancelled) return error;
   if (aborted) return new AnboError("Run cancelled.", "ANBO_CANCELLED", EXIT_CODE.cancelled);
   if (error instanceof AnboError) return error;
   return new AnboError(error instanceof Error ? error.message : String(error), "ANBO_UNEXPECTED");
@@ -391,12 +427,11 @@ function fallbackArgs(argv: string[]): ParsedCliArgs {
 }
 
 function toJsonData(value: unknown): JsonObject {
-  const parsed = JSON.parse(JSON.stringify(value)) as JsonValue;
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : { value: parsed };
+  return safeJsonObject(value);
 }
 
 function toJsonArray(value: unknown[]): JsonValue {
-  return JSON.parse(JSON.stringify(value)) as JsonValue;
+  return safeJsonValue(value);
 }
 
 const HELP = `Anbo CLI ${CLI_VERSION}
@@ -411,6 +446,8 @@ Core commands:
   test            Run target smoke or integration tests
   logs            Stream structured target logs
   debug           Collect deterministic diagnostics
+  run             Execute a command in a target service
+  reset           Reset and redeploy target state
   down            Stop and remove the target deployment
   doctor          Check core, project, and plugin compatibility
   plugin list     List known and configured plugins
@@ -421,6 +458,9 @@ Compatibility:
 
 MiniStack deploy options:
   --reconcile              Force a full Terraform refresh
+
+MiniStack configure options:
+  --refresh                Merge newly discovered project topology
 
 Global options:
   --target <id>            Select a target

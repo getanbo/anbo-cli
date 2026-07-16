@@ -1,11 +1,19 @@
 import { EXIT_CODE } from "./constants.js";
 
+export interface AnboErrorMetadata {
+  phase?: string;
+  retryable?: boolean;
+  safe_to_retry?: boolean;
+  evidence?: unknown;
+}
+
 export class AnboError extends Error {
   constructor(
     message: string,
     readonly code: string,
     readonly exitCode: number = EXIT_CODE.operationFailed,
     readonly hint?: string,
+    readonly metadata?: AnboErrorMetadata,
   ) {
     super(message);
     this.name = "AnboError";

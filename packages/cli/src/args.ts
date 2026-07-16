@@ -136,7 +136,7 @@ function expectsValue(name: string): boolean {
 }
 
 function isBooleanFlag(name: string): boolean {
-  return new Set(["dry-run", "follow", "force", "purge", "reconcile", "test", "wait", "yes"]).has(name);
+  return new Set(["dry-run", "follow", "force", "purge", "reconcile", "refresh", "test", "wait", "yes"]).has(name);
 }
 
 function addFlag(

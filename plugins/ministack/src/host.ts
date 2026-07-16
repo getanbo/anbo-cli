@@ -20,16 +20,19 @@ export class HostCommandExecutor implements CommandExecutor {
         ? options.signal.reason
         : new DOMException("The operation was aborted", "AbortError");
     }
-    const result = await this.context.process.run(command, args, {
+    const run = options.cleanup === true && this.context.process.cleanup !== undefined
+      ? this.context.process.cleanup.bind(this.context.process)
+      : this.context.process.run.bind(this.context.process);
+    const result = await run(command, args, {
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.env === undefined ? {} : { env: options.env }),
       ...(options.input === undefined ? {} : {
         input: typeof options.input === "string" ? options.input : Buffer.from(options.input).toString("utf8"),
       }),
+      ...(options.cleanup === true || options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.onOutput === undefined ? {} : { on_output: options.onOutput }),
       allow_failure: true,
     });
-    if (result.stdout.length > 0) await options.onOutput?.("stdout", result.stdout);
-    if (result.stderr.length > 0) await options.onOutput?.("stderr", result.stderr);
     return { code: result.exit_code, stdout: result.stdout, stderr: result.stderr };
   }
 }

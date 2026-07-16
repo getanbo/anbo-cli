@@ -5,7 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { realpathSync } from "node:fs";
 import test from "node:test";
-import { createDefaultManifest, loadManifest, parseManifest, writeManifest } from "../src/config.js";
+import {
+  createDefaultManifest,
+  loadManifest,
+  manifestHasPlaceholderDiscovery,
+  parseManifest,
+  refreshManifest,
+  writeManifest,
+} from "../src/config.js";
 import { discoverProject, discoverSdks, discoverTerraform } from "../src/discovery.js";
 import { routeTerraformVariableFiles } from "../src/terraform-layout.js";
 import { AnboError, type DiscoveryReport, type SandboxManifest } from "../src/types.js";
@@ -162,6 +169,53 @@ test("Terraform discovery keeps root and nested variable files project-relative"
     roots: ["."],
     variable_files: ["terraform.tfvars", "vars/development.tfvars.json"]
   });
+});
+
+test("refresh replaces an empty-project root placeholder without erasing user configuration", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "anbo-refresh-discovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  mkdirSync(join(root, "infra"));
+  writeFileSync(join(root, "infra", "main.tf"), 'resource "aws_s3_bucket" "assets" {}\n');
+  writeFileSync(join(root, "infra", "local.tfvars"), 'stage = "local"\n');
+  writeFileSync(join(root, "Dockerfile"), "FROM scratch\n");
+
+  const initial = createDefaultManifest({ root, terraform: [], sdk: [], dockerfiles: [] });
+  initial.services.api = { image: "api:dev", environment: { LOG_LEVEL: "info" } };
+  initial.tests.smoke = { command: ["npm", "test"], service: "api", default: true };
+  const report = discoverProject(root);
+  assert.equal(manifestHasPlaceholderDiscovery(initial, report), true);
+  const refreshed = refreshManifest(initial, report);
+
+  assert.equal(refreshed.changed, true);
+  assert.deepEqual(refreshed.manifest.terraform, {
+    roots: ["infra"],
+    variable_files: ["infra/local.tfvars"],
+  });
+  assert.deepEqual(refreshed.manifest.services, initial.services);
+  assert.deepEqual(refreshed.manifest.tests, initial.tests);
+  assert.equal(Object.values(refreshed.manifest.builds).some((build) => build.context === "."), true);
+});
+
+test("placeholder repair discovers root-level variables and Docker builds", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "anbo-refresh-root-discovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const initial = createDefaultManifest({ root, terraform: [], sdk: [], dockerfiles: [] });
+  writeFileSync(join(root, "main.tf"), 'resource "aws_s3_bucket" "assets" {}\n');
+  writeFileSync(join(root, "terraform.tfvars"), 'stage = "local"\n');
+  writeFileSync(join(root, "Dockerfile"), "FROM scratch\n");
+
+  const report = discoverProject(root);
+  assert.equal(report.terraform[0]?.path, ".");
+  assert.equal(manifestHasPlaceholderDiscovery(initial, report), true);
+  const refreshed = refreshManifest(initial, report);
+
+  assert.equal(refreshed.changed, true);
+  assert.deepEqual(refreshed.manifest.terraform, {
+    roots: ["."],
+    variable_files: ["terraform.tfvars"],
+  });
+  assert.equal(Object.values(refreshed.manifest.builds).some((build) =>
+    build.context === "." && build.dockerfile === "Dockerfile"), true);
 });
 
 test("Terraform discovery excludes referenced nested local modules as roots", async (t) => {

@@ -13,7 +13,12 @@ export interface RedactorOptions {
 }
 
 const DEFAULT_SENSITIVE_KEYS =
-  /(?:^|[_-])(?:authorization|cookie|credential|database_url|dsn|password|passwd|private_key|secret|session_token|token)(?:$|[_-])/i;
+  /(?:^|[_-])(?:access_key|api_key|auth|authorization|cookie|credential|database_url|dsn|encryption_key|key|password|passwd|private_key|secret|secret_key|session_token|signing_key|token)(?:$|[_-])/i;
+
+export function isSensitiveKey(key: string): boolean {
+  DEFAULT_SENSITIVE_KEYS.lastIndex = 0;
+  return DEFAULT_SENSITIVE_KEYS.test(key);
+}
 
 const DEFAULT_PATTERNS: RedactionPattern[] = [
   { pattern: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g },
@@ -132,6 +137,7 @@ export class Redactor {
       value,
       (input) => this.redactString(input),
       (key) => {
+        if (this.sensitiveKeys === DEFAULT_SENSITIVE_KEYS) return isSensitiveKey(key);
         this.sensitiveKeys.lastIndex = 0;
         return this.sensitiveKeys.test(key);
       },

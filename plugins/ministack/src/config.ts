@@ -216,13 +216,7 @@ export function parseManifest(value: unknown): SandboxManifest {
 
 export function createDefaultManifest(discovery: DiscoveryReport): SandboxManifest {
   const projectName = safeIdentifier(basename(discovery.root));
-  const builds: SandboxManifest["builds"] = {};
-  for (const dockerfile of discovery.dockerfiles) {
-    let name = safeIdentifier(dockerfile.context === "." ? projectName : dockerfile.context.replaceAll("/", "-"));
-    let suffix = 2;
-    while (Object.hasOwn(builds, name)) name = `${safeIdentifier(projectName)}-${suffix++}`;
-    builds[name] = { context: dockerfile.context, dockerfile: relative(dockerfile.context, dockerfile.path) || basename(dockerfile.path) };
-  }
+  const builds = discoveredBuilds(discovery, projectName);
   return {
     $schema: "https://raw.githubusercontent.com/getanbo/anbo-cli/main/plugins/ministack/schemas/sandbox.v2.schema.json",
     schema_version: ANBO_MANIFEST_VERSION,
@@ -244,6 +238,79 @@ export function createDefaultManifest(discovery: DiscoveryReport): SandboxManife
     network: { allow_hosts: [], clone_egress: true },
     adapters: {}
   };
+}
+
+export function refreshManifest(
+  existing: SandboxManifest,
+  discovery: DiscoveryReport,
+): { manifest: SandboxManifest; changed: boolean } {
+  const manifest = structuredClone(existing);
+  const discoveredRoots = discovery.terraform.map((entry) => entry.path);
+  const placeholderRoot = manifest.terraform.roots.length === 1
+    && manifest.terraform.roots[0] === "."
+    && discoveredRoots.length > 0
+    && !discoveredRoots.includes(".");
+  if (placeholderRoot) {
+    manifest.terraform.roots = discoveredRoots;
+    manifest.terraform.variable_files = discovery.terraform
+      .flatMap((entry) => entry.variable_files)
+      .sort();
+  } else {
+    manifest.terraform.roots = orderedUnion(manifest.terraform.roots, discoveredRoots);
+    manifest.terraform.variable_files = orderedUnion(
+      manifest.terraform.variable_files,
+      discovery.terraform.flatMap((entry) => entry.variable_files),
+    );
+  }
+
+  const discovered = discoveredBuilds(discovery, manifest.project.name);
+  for (const [suggestedName, build] of Object.entries(discovered)) {
+    const alreadyConfigured = Object.values(manifest.builds).some((candidate) =>
+      candidate.command === undefined
+      && candidate.context === build.context
+      && (candidate.dockerfile ?? "Dockerfile") === (build.dockerfile ?? "Dockerfile")
+    );
+    if (alreadyConfigured) continue;
+    let name = suggestedName;
+    let suffix = 2;
+    while (Object.hasOwn(manifest.builds, name)) name = `${suggestedName}-${suffix++}`;
+    manifest.builds[name] = build;
+  }
+  parseManifest(manifest);
+  return { manifest, changed: JSON.stringify(manifest) !== JSON.stringify(existing) };
+}
+
+export function manifestHasPlaceholderDiscovery(
+  manifest: SandboxManifest,
+  discovery: DiscoveryReport,
+): boolean {
+  if (manifest.terraform.roots.length !== 1 || manifest.terraform.roots[0] !== "." ||
+      manifest.terraform.variable_files.length > 0 || Object.keys(manifest.builds).length > 0) {
+    return false;
+  }
+  const discoveredVariableFiles = discovery.terraform.flatMap((entry) => entry.variable_files);
+  return discovery.terraform.some((entry) => entry.path !== ".")
+    || discoveredVariableFiles.length > 0
+    || discovery.dockerfiles.length > 0;
+}
+
+function discoveredBuilds(discovery: DiscoveryReport, projectName: string): SandboxManifest["builds"] {
+  const builds: SandboxManifest["builds"] = {};
+  for (const dockerfile of discovery.dockerfiles) {
+    const baseName = safeIdentifier(dockerfile.context === "." ? projectName : dockerfile.context.replaceAll("/", "-"));
+    let name = baseName;
+    let suffix = 2;
+    while (Object.hasOwn(builds, name)) name = `${baseName}-${suffix++}`;
+    builds[name] = {
+      context: dockerfile.context,
+      dockerfile: relative(dockerfile.context, dockerfile.path) || basename(dockerfile.path),
+    };
+  }
+  return builds;
+}
+
+function orderedUnion(left: readonly string[], right: readonly string[]): string[] {
+  return [...new Set([...left, ...right])];
 }
 
 export function writeManifest(path: string, manifest: SandboxManifest, options: { overwrite?: boolean } = {}): void {

@@ -14,6 +14,8 @@ assert.ok(upstreamVersion);
 
 const runtimeUrl = new URL("../runtime-manifest.json", import.meta.url);
 const runtime = JSON.parse(await readFile(runtimeUrl, "utf8"));
+const platform = process.env.ANBO_MINISTACK_PLATFORM ?? runtime.platform;
+assert.match(platform ?? "", /^linux\/(?:amd64|arm64)$/);
 runtime.source = "anbo-ministack";
 runtime.upstream.version = upstreamVersion;
 runtime.upstream.commit = upstreamSha;
@@ -24,6 +26,7 @@ runtime.downstream = {
 };
 runtime.certified_image = `ghcr.io/getanbo/anbo-ministack@${digest}`;
 runtime.digest = digest;
+runtime.platform = platform;
 await writeFile(runtimeUrl, `${JSON.stringify(runtime, null, 2)}\n`);
 
 const fixtureUrl = new URL("../fixtures/terraform-smoke/.anbo/sandbox.json", import.meta.url);

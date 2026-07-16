@@ -236,6 +236,7 @@ export interface DeployRequest {
 export interface DiagnosticDetails {
   cause?: string;
   evidence?: unknown;
+  phase?: string;
   remediation?: string;
   retryable?: boolean;
   safe_to_retry?: boolean;

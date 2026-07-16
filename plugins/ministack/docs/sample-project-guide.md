@@ -23,7 +23,7 @@ smoke test demonstrates what actually works.
 At the end, this command should perform all setup and acceptance work:
 
 ```bash
-anbo deploy --target ministack --run-id notes-deploy-001 --output jsonl
+anbo deploy --target ministack --output jsonl
 ```
 
 ## 1. Install the CLI
@@ -143,7 +143,7 @@ a common configured root.
 Before choosing a service, inspect the machine-readable fidelity report:
 
 ```bash
-anbo capabilities --run-id notes-capabilities-001 --output json
+anbo capabilities --output json
 ```
 
 The report is not an allowlist. Terraform may attempt any `hashicorp/aws`
@@ -156,14 +156,14 @@ a real virtual machine.
 Preview discovery before writing anything:
 
 ```bash
-anbo configure --dry-run --run-id notes-config-preview-001 --output json
+anbo configure --dry-run --output json
 ```
 
 Confirm that `terraform_roots` contains `infra`, and review the Dockerfile and
 SDK hints. Then write the manifest:
 
 ```bash
-anbo configure --run-id notes-config-write-001 --output json
+anbo configure --output json
 ```
 
 `configure` only discovers and writes `.anbo/sandbox.json`. It never edits your
@@ -172,7 +172,7 @@ than using `--force` unless you explicitly want to regenerate it. To preview
 fresh discovery without overwriting an existing manifest, use:
 
 ```bash
-anbo configure --force --dry-run --run-id notes-config-refresh-001 --output json
+anbo configure --force --dry-run --output json
 ```
 
 ## 5. Package the Application
@@ -231,14 +231,6 @@ manifest. Keep the generated MiniStack tag and digest unchanged.
   "builds": {
     "api": {
       "context": ".",
-      "inputs": [
-        ".dockerignore",
-        "Dockerfile",
-        "package.json",
-        "package-lock.json",
-        "src",
-        "scripts"
-      ],
       "dockerfile": "Dockerfile"
     }
   },
@@ -295,9 +287,10 @@ manifest. Keep the generated MiniStack tag and digest unchanged.
 }
 ```
 
-The `inputs` list controls build invalidation. Keep it narrow and complete. Anbo
-reuses a Docker image only when the fingerprint matches and the image still
-exists, so unrelated Terraform edits do not rebuild the API.
+Docker build invalidation follows the complete effective context after
+`.dockerignore` filtering. Keep `.dockerignore` narrow and complete; `inputs`
+applies only to command builds. Anbo reuses a Docker image only when the
+fingerprint matches and the image still exists.
 
 Omit `host` from a port to let Docker allocate a free loopback port. Read the
 actual address from the terminal deploy summary or `anbo status`; do not assume
@@ -371,7 +364,7 @@ First isolate infrastructure, build, and health-check failures from test
 failures:
 
 ```bash
-anbo deploy --no-test --timeout 900 --run-id notes-infra-001 --output jsonl
+anbo deploy --no-test --output jsonl
 ```
 
 The last record must be `run.finished` with `status: "succeeded"`. Its summary
@@ -381,13 +374,13 @@ outputs, build fingerprints, and cache-hit status.
 Now run the configured test through the existing sandbox:
 
 ```bash
-anbo test notes-smoke --timeout 120 --run-id notes-test-001 --output jsonl
+anbo test notes-smoke --output jsonl
 ```
 
 Once both pass, use the single-command path that agents and CI should rely on:
 
 ```bash
-anbo sandbox up --timeout 900 --run-id notes-deploy-001 --output jsonl
+anbo sandbox up --output jsonl
 ```
 
 Never substitute these commands with `terraform apply`, `docker run`, or
@@ -395,9 +388,12 @@ Never substitute these commands with `terraform apply`, `docker run`, or
 redaction, caching, locks, structured feedback, and the exact product path you
 need to validate.
 
-Run IDs must be unique for each operation. Anbo creates one when omitted, but an
-agent should normally supply a readable unique ID so it can call `debug` on the
-exact failed run.
+Run IDs are unique and host-owned. Read the `runId` on `run.started` or
+`run.finished` and retain the JSONL stream so an agent can call `debug` on the
+exact failed run. User-supplied run IDs are not accepted as correlation IDs.
+There is no ignored `--timeout` shortcut: configure test deadlines with each
+manifest test's `timeout_seconds`, and let the caller impose a whole-command
+deadline when orchestration requires one.
 
 ## 9. Add Cloud Data Clones
 
@@ -486,7 +482,7 @@ with a `source` alias and export `ANBO_API_URL` and `ANBO_TOKEN`. See
 Deploy after source or Terraform changes:
 
 ```bash
-anbo deploy --timeout 900 --run-id notes-deploy-002 --output jsonl
+anbo deploy --output jsonl
 ```
 
 Unchanged command builds and Docker images are reused. A normal deploy starts no
@@ -498,7 +494,7 @@ inferring them from elapsed time.
 Request an explicit drift refresh when needed:
 
 ```bash
-anbo deploy --reconcile --timeout 900 --run-id notes-reconcile-001 --output jsonl
+anbo deploy --reconcile --output jsonl
 ```
 
 Reconciliation still runs init, validation, and plan, but a no-change plan does
@@ -509,11 +505,11 @@ source lock remains unchanged, and lockless projects do not reuse that cache.
 Use these commands instead of dropping below the CLI:
 
 ```bash
-anbo status --run-id notes-status-001 --output json
-anbo test notes-smoke --timeout 120 --run-id notes-test-002 --output jsonl
-anbo logs --follow --service api --run-id notes-logs-001 --output jsonl
-anbo run --run-id notes-shell-check-001 --output jsonl -- node -e "console.log(process.env.ANBO_MINISTACK_ENDPOINT)"
-anbo cache inspect --run-id notes-cache-001 --output json
+anbo status --output json
+anbo test notes-smoke --output jsonl
+anbo logs --follow --service api --output jsonl
+anbo run --output jsonl -- node -e "console.log(process.env.ANBO_MINISTACK_ENDPOINT)"
+anbo cache inspect --output json
 ```
 
 `anbo run` executes in the first declared running service. Use it for a focused
@@ -521,10 +517,12 @@ inspection, not as a replacement for a checked-in smoke suite.
 `logs --follow` has no deadline option; stop it with an interrupt when enough
 evidence has been collected.
 
-If a run fails, use its original run ID:
+If a run fails, retain its JSONL and use the host-issued run ID:
 
 ```bash
-anbo debug notes-deploy-002 --run-id notes-debug-001 --output json
+anbo deploy --output jsonl >anbo-deploy.jsonl
+RUN_ID=$(jq -r 'select(.type == "run.started") | .runId' anbo-deploy.jsonl)
+anbo debug "$RUN_ID" --output json
 ```
 
 Read the stable `ANBO_*` diagnostic code, cause, evidence, remediation, and
@@ -546,19 +544,19 @@ retry guidance. Common exit codes are:
 `down` stops managed containers but keeps reusable local state:
 
 ```bash
-anbo down --run-id notes-down-001 --output jsonl
+anbo down --output jsonl
 ```
 
 Reset MiniStack and private Terraform state, then deploy again:
 
 ```bash
-anbo reset --timeout 900 --run-id notes-reset-001 --output jsonl
+anbo reset --output jsonl
 ```
 
 Remove the project's local state and MiniStack volume:
 
 ```bash
-anbo down --purge --run-id notes-purge-001 --output jsonl
+anbo down --purge --output jsonl
 ```
 
 External clones are never deleted by Anbo. `--purge-clones` applies only to

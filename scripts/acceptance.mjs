@@ -70,6 +70,11 @@ try {
   assert.deepEqual(testResult.data.passthrough, ["npm", "test"]);
   assert.deepEqual(testResult.data.args, ["smoke", "--", "npm", "test"]);
 
+  const ran = await cli(["run", "--root", projectRoot, "--", "echo", "ready"]);
+  assert.equal(ran.events.find((event) => event.type === "command.result").data.action, "run");
+  const reset = await cli(["reset", "--root", projectRoot, "--no-test"]);
+  assert.equal(reset.events.find((event) => event.type === "command.result").data.action, "reset");
+
   const logged = await cli(["logs", "--root", projectRoot]);
   assert.equal(logged.events.some((event) => event.type === "log.line"), true);
   const secret = "anbo-acceptance-token-value";
@@ -78,6 +83,57 @@ try {
   });
   assert.equal(debugged.stdout.includes(secret), false, "resolved secrets must be redacted");
   assert.equal(debugged.stdout.includes("[REDACTED]"), true);
+
+  const failed = await cli(["debug", "--root", projectRoot, "--simulate-failure"], { exitCode: 6 });
+  const failureDiagnostics = failed.events.filter((event) =>
+    event.type === "diagnostic" && event.data?.code === "ANBO_FIXTURE_TERRAFORM"
+  );
+  assert.equal(failureDiagnostics.length, 1, "the canonical plugin failure must be emitted exactly once");
+  assert.equal(failureDiagnostics[0].message, "fixture Terraform failed");
+  assert.equal(failureDiagnostics[0].data.remediation, "Correct the fixture Terraform and retry.");
+  assert.equal(failureDiagnostics[0].data.phase, "terraform.plan");
+  assert.equal(failureDiagnostics[0].data.retryable, true);
+  assert.equal(failureDiagnostics[0].data.safe_to_retry, true);
+  assert.deepEqual(failureDiagnostics[0].data.evidence, { address: "aws_sqs_queue.fixture" });
+  const failedRunId = failed.events[0].runId;
+  const debuggedFailedRun = await cli([
+    "debug", failedRunId, "--root", projectRoot, "--verify-run-id",
+  ]);
+  const debuggedFailedRunResult = debuggedFailedRun.events.find((event) => event.type === "command.result");
+  assert.equal(debuggedFailedRunResult.data.inspected_run_id, failedRunId);
+  assert.notEqual(debuggedFailedRunResult.data.current_run_id, failedRunId);
+
+  const cancelledWrongExit = await cli([
+    "debug", "--root", projectRoot, "--simulate-cancelled-wrong-exit",
+  ], { exitCode: 130 });
+  assert.equal(cancelledWrongExit.events.at(-1).data.status, "cancelled");
+  assert.equal(cancelledWrongExit.events.at(-1).data.exitCode, 130);
+  const failedCancellationExit = await cli([
+    "debug", "--root", projectRoot, "--simulate-failed-cancel-exit",
+  ], { exitCode: 5 });
+  assert.equal(failedCancellationExit.events.at(-1).data.status, "failed");
+  assert.equal(failedCancellationExit.events.at(-1).data.exitCode, 5);
+
+  await assertStreamingOutput(installRoot, projectRoot);
+
+  const trappedStartedAt = Date.now();
+  const trapped = await cli(["debug", "--root", projectRoot, "--simulate-sigterm-trap"]);
+  const trappedDuration = Date.now() - trappedStartedAt;
+  const trappedResult = trapped.events.find((event) => event.type === "command.result");
+  assert.equal(trappedResult.data.exit_code, 128);
+  assert.ok(trappedResult.data.duration_ms >= 150, "the process timeout fired too early");
+  assert.ok(trappedDuration < 2_000, "a child trapping SIGTERM blocked the installed CLI");
+
+  const oddEvidence = await cli(["debug", "--root", projectRoot, "--simulate-malformed-evidence"], { exitCode: 7 });
+  const oddEvent = oddEvidence.events.find((event) => event.type === "fixture.odd-event");
+  assert.deepEqual(oddEvent.data.fields, { count: "2", self: "[CIRCULAR]" });
+  assert.equal(oddEvent.data.total, "3");
+  assert.equal(oddEvent.data.self, "[CIRCULAR]");
+  const oddPhase = oddEvidence.events.find((event) => event.type === "phase.failed");
+  assert.deepEqual(oddPhase.data.fields, { attempts: "4", self: "[CIRCULAR]" });
+  const oddDiagnostic = oddEvidence.events.find((event) => event.data?.code === "ANBO_FIXTURE_ODD_EVIDENCE");
+  assert.deepEqual(oddDiagnostic.data.evidence, { count: "1", self: "[CIRCULAR]" });
+  assert.equal(oddEvidence.events.at(-1).type, "run.finished");
 
   const warm = await cli(["sandbox", "up", "--root", projectRoot, "--no-test"]);
   const warmResult = warm.events.find((event) => event.type === "command.result");
@@ -138,7 +194,9 @@ function run(command, args, cwd) {
 
 async function assertCancellation(installRoot, projectRoot, assertEventStream) {
   const binary = join(installRoot, "node_modules", ".bin", "anbo");
-  const child = spawn(binary, ["logs", "--follow", "--root", projectRoot, "--output", "jsonl"], {
+  const child = spawn(binary, [
+    "logs", "--follow", "--simulate-uncertain-cancel", "--root", projectRoot, "--output", "jsonl",
+  ], {
     cwd: installRoot,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -171,4 +229,43 @@ async function assertCancellation(installRoot, projectRoot, assertEventStream) {
   const events = stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
   assertEventStream(events);
   assert.equal(events.some((event) => event.type === "run.cancellation_requested"), true);
+  const diagnostic = events.find((event) => event.data?.code === "ANBO_FIXTURE_CANCEL_UNCERTAIN");
+  assert.equal(diagnostic?.data.safe_to_retry, false);
+  assert.equal(diagnostic?.data.retryable, true);
+  assert.deepEqual(diagnostic?.data.evidence, { operation: "fixture-create" });
+}
+
+async function assertStreamingOutput(installRoot, projectRoot) {
+  const binary = join(installRoot, "node_modules", ".bin", "anbo");
+  const child = spawn(binary, ["debug", "--simulate-stream", "--root", projectRoot, "--output", "jsonl"], {
+    cwd: installRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let firstChunkAt;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    if (firstChunkAt === undefined && stdout.includes("stream-one")) firstChunkAt = Date.now();
+  });
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const exitCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("streaming acceptance timed out"));
+    }, 10_000);
+    child.once("error", reject);
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      resolve(code);
+    });
+  });
+  const finishedAt = Date.now();
+  assert.equal(exitCode, 0, stdout || stderr);
+  assert.equal(stderr, "");
+  assert.ok(firstChunkAt !== undefined, "the first process chunk was not emitted");
+  assert.ok(finishedAt - firstChunkAt >= 300, "the CLI did not expose output while the child was running");
+  assert.match(stdout, /stream-two/);
 }

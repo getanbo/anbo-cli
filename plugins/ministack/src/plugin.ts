@@ -14,7 +14,9 @@ import {
   DEFAULT_MANIFEST_PATH,
   createDefaultManifest,
   loadManifest,
+  manifestHasPlaceholderDiscovery,
   parseManifest,
+  refreshManifest,
   resolveManifestPath,
   writeManifest,
 } from "./config.js";
@@ -34,7 +36,7 @@ export const descriptor: PluginDescriptorV1 = {
   engines: { anbo: ">=0.2.0 <0.3.0", node: ">=22.0.0" },
   kinds: ["target"],
   targets: ["ministack"],
-  actions: ["configure", "deploy", "status", "test", "logs", "debug", "down", "capabilities", "cache"],
+  actions: ["configure", "deploy", "status", "test", "logs", "debug", "run", "reset", "down", "capabilities", "cache"],
   config: { schema: "./schemas/plugin-config.v1.schema.json", schema_version: 1 },
   capabilities: [
     "terraform.discovery",
@@ -58,8 +60,13 @@ class MiniStackTarget implements TargetProviderV1 {
     if (request.api_version !== 1) {
       return failed("ANBO_PLUGIN_API_MISMATCH", `MiniStack target requires api_version 1, received ${String(request.api_version)}`);
     }
-    const runId = typeof request.flags["run-id"] === "string" ? request.flags["run-id"] : undefined;
-    const sink = new PluginEventSink(this.context, runId);
+    const invalidFlag = unsupportedFlag(request.action, request.flags);
+    if (invalidFlag !== undefined) {
+      return invalidFlag === "run-id"
+        ? failed("ANBO_RUN_ID_HOST_OWNED", "--run-id is not accepted; Anbo assigns the canonical run ID")
+        : failed("ANBO_UNSUPPORTED_FLAG", `--${invalidFlag} is not supported for anbo ${request.action}`);
+    }
+    const sink = new PluginEventSink(this.context, request.run_id);
     try {
       const summary = request.action === "configure"
         ? await this.configure(request, sink)
@@ -67,19 +74,21 @@ class MiniStackTarget implements TargetProviderV1 {
       return { status: "succeeded", data: { ...summary } };
     } catch (cause) {
       const error = toAnboError(cause, this.context.signal);
-      const remediation = error.details?.remediation ?? remediationFor(error.code);
-      await sink.diagnostic({
+      const remediation = sink.redactor.redactString(error.details?.remediation ?? remediationFor(error.code));
+      const diagnostic = {
         code: error.code,
-        cause: error.message,
+        message: sink.redactor.redactString(error.message),
         remediation,
+        phase: error.details?.phase,
         retryable: error.details?.retryable ?? false,
         safe_to_retry: error.details?.safe_to_retry ?? false,
-        evidence: error.details?.evidence,
-      }).catch(() => undefined);
+        evidence: error.details?.evidence === undefined ? undefined : sink.redactor.redact(error.details.evidence),
+      };
       return {
         status: error.exitCode === ExitCode.Cancelled ? "cancelled" : "failed",
         data: { action: request.action, exit_code: error.exitCode },
-        diagnostics: [{ code: error.code, message: error.message, remediation }],
+        failure: { ...diagnostic, exit_code: error.exitCode },
+        diagnostics: [diagnostic],
       };
     }
   }
@@ -90,12 +99,17 @@ class MiniStackTarget implements TargetProviderV1 {
     const manifestPath = resolveManifestPath(discovery.root, manifestPathFrom(request.config));
     const existed = existsSync(manifestPath);
     const force = request.flags["force"] === true;
+    const refresh = request.flags["refresh"] === true;
     const dryRun = request.flags["dry-run"] === true;
-    const manifest = existed && !force
-      ? loadManifest(discovery.root, manifestPathFrom(request.config)).manifest
-      : createDefaultManifest(discovery);
+    const current = existed ? loadManifest(discovery.root, manifestPathFrom(request.config)).manifest : undefined;
+    const manifest = current === undefined || force
+      ? createDefaultManifest(discovery)
+      : refresh
+        ? refreshManifest(current, discovery).manifest
+        : current;
     parseManifest(manifest);
-    if (!dryRun && (!existed || force)) writeManifest(manifestPath, manifest, { overwrite: force });
+    const updated = existed && JSON.stringify(current) !== JSON.stringify(manifest);
+    if (!dryRun && (!existed || force || updated)) writeManifest(manifestPath, manifest, { overwrite: existed });
     await phase.finish("Terraform discovery complete", {
       terraform_roots: discovery.terraform.map((entry) => entry.path),
       sdk_hints: discovery.sdk,
@@ -106,7 +120,7 @@ class MiniStackTarget implements TargetProviderV1 {
       status: "succeeded",
       manifest_path: manifestPath,
       created: !existed && !dryRun,
-      updated: existed && force && !dryRun,
+      updated: updated && !dryRun,
       dry_run: dryRun,
       discovery,
       manifest,
@@ -115,14 +129,34 @@ class MiniStackTarget implements TargetProviderV1 {
 
   private async run(request: TargetRequestV1, sink: PluginEventSink): Promise<RunSummary> {
     const action = request.action as CommandAction;
-    const { manifest, path } = runtimeManifest(request);
+    let { manifest, path } = runtimeManifest(request);
+    const canRefreshDiscovery = action === "deploy" || action === "reset";
+    const discovery = canRefreshDiscovery ? discoverProject(request.project.root) : undefined;
+    if (discovery !== undefined && manifestHasPlaceholderDiscovery(manifest, discovery)) {
+      const refreshed = refreshManifest(manifest, discovery);
+      manifest = refreshed.manifest;
+      if (refreshed.changed) {
+        writeManifest(path, manifest, { overwrite: true });
+        await sink.emit({
+          kind: "progress",
+          phase: "configure.refresh",
+          source: "anbo.ministack.configure",
+          level: "info",
+          message: "Discovered project topology replaced the empty-project placeholder",
+          fields: { terraform_roots: manifest.terraform.roots, builds: Object.keys(manifest.builds) },
+          redacted: true,
+        });
+      }
+    }
     return await runDeploy({
       root: request.project.root,
       runtimeProjectId: request.project.runtime_id,
       manifestPath: path,
       manifest,
       action,
-      args: [...request.args],
+      args: action === "run" && request.passthrough !== undefined && request.passthrough.length > 0
+        ? [...request.passthrough]
+        : [...request.args],
       flags: request.flags,
       env: process.env,
       ...(this.context.signal === undefined ? {} : { signal: this.context.signal }),
@@ -133,6 +167,23 @@ class MiniStackTarget implements TargetProviderV1 {
       fetch: hostFetch(this.context),
     }, sink);
   }
+}
+
+function unsupportedFlag(action: TargetRequestV1["action"], flags: TargetRequestV1["flags"]): string | undefined {
+  const allowed: Readonly<Record<TargetRequestV1["action"], ReadonlySet<string>>> = {
+    configure: new Set(["dry-run", "force", "refresh"]),
+    deploy: new Set(["test", "no-test", "reconcile"]),
+    status: new Set(),
+    test: new Set(),
+    logs: new Set(["follow", "service"]),
+    debug: new Set(),
+    run: new Set(),
+    reset: new Set(["test", "no-test", "reconcile", "fresh-clones"]),
+    down: new Set(["purge", "purge-clones"]),
+    capabilities: new Set(),
+    cache: new Set(),
+  };
+  return Object.keys(flags).sort().find((name) => !allowed[action].has(name));
 }
 
 function runtimeManifest(request: TargetRequestV1): { manifest: SandboxManifest; path: string } {
@@ -159,7 +210,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function failed(code: string, message: string): TargetResultV1 {
-  return { status: "failed", diagnostics: [{ code, message }] };
+  const diagnostic = {
+    code,
+    message,
+    retryable: false,
+    safe_to_retry: false,
+    remediation: remediationFor(code),
+  };
+  return {
+    status: "failed",
+    failure: { ...diagnostic, exit_code: ExitCode.Configuration },
+    diagnostics: [diagnostic],
+  };
 }
 
 function toAnboError(cause: unknown, signal?: AbortSignal): AnboError {

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync, type Stats } from "node:fs";
+import { lstat, mkdir, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import dockerIgnore, { type Ignore } from "@balena/dockerignore";
 import type { BuildConfig } from "../types.js";
 import type { CommandExecutor } from "./ministack.js";
 import { ProcessCommandExecutor, safeProjectId } from "./ministack.js";
@@ -23,7 +24,14 @@ interface BuildState {
   completed_at: string;
 }
 
-const IGNORED_DIRECTORIES = new Set([".git", ".anbo", ".terraform", "node_modules"]);
+interface BuildInput {
+  path: string;
+  relativePath: string;
+  details: Stats;
+  dereferencedContent?: Buffer;
+}
+
+const createDockerIgnore = dockerIgnore as unknown as (options?: { ignorecase?: boolean }) => Ignore;
 
 export async function buildDeclaredImages(
   options: {
@@ -40,14 +48,15 @@ export async function buildDeclaredImages(
 ): Promise<Record<string, BuildResult>> {
   const commands = dependencies.commands ?? new ProcessCommandExecutor();
   const projectId = safeProjectId(options.projectId);
-  const declaredOutputs = Object.values(options.builds).flatMap((build) => (build.outputs ?? []).map((path) => resolve(options.root, path)));
   const results: Record<string, BuildResult> = {};
+  let buildxAvailable: boolean | undefined;
   for (const [name, config] of Object.entries(options.builds)) {
     const context = resolve(options.root, config.context);
     const cacheDirectory = join(options.cacheRoot, projectId, safeProjectId(name));
     const statePath = join(cacheDirectory, "state.json");
     await mkdir(cacheDirectory, { recursive: true, mode: 0o700 });
-    const fingerprint = await buildFingerprint(options.root, context, config, [cacheDirectory, ...declaredOutputs]);
+    const ownOutputs = (config.outputs ?? []).map((path) => resolve(options.root, path));
+    const fingerprint = await buildFingerprint(options.root, context, config, [cacheDirectory, ...ownOutputs]);
     const previous = await readBuildState(statePath);
 
     if (config.command !== undefined) {
@@ -85,15 +94,13 @@ export async function buildDeclaredImages(
       const buildkitCache = join(cacheDirectory, "buildkit");
       const nextCache = join(cacheDirectory, `buildkit-next-${randomUUID()}`);
       const metadataPath = join(cacheDirectory, `metadata-${randomUUID()}.json`);
-      const args = [
-        "buildx", "build", "--load", "--pull",
+      buildxAvailable ??= await hasBuildx(commands, options.signal);
+      const commonArgs = [
+        "--pull",
         "--tag", image,
         "--label", "anbo.dev/managed=true",
         "--label", `anbo.dev/project=${projectId}`,
         "--label", `anbo.dev/build=${name}`,
-        ...(existsSync(buildkitCache) ? ["--cache-from", `type=local,src=${buildkitCache}`] : []),
-        "--cache-to", `type=local,dest=${nextCache},mode=max`,
-        "--metadata-file", metadataPath,
         "--file", resolve(context, config.dockerfile ?? "Dockerfile"),
         ...(config.target === undefined ? [] : ["--target", config.target]),
         ...(config.platform === undefined ? [] : ["--platform", config.platform]),
@@ -101,6 +108,16 @@ export async function buildDeclaredImages(
           .flatMap(([key, value]) => ["--build-arg", `${key}=${value}`]),
         context,
       ];
+      const args = buildxAvailable
+        ? [
+            "buildx", "build", "--load",
+            ...commonArgs.slice(0, -1),
+            ...(existsSync(buildkitCache) ? ["--cache-from", `type=local,src=${buildkitCache}`] : []),
+            "--cache-to", `type=local,dest=${nextCache},mode=max`,
+            "--metadata-file", metadataPath,
+            context,
+          ]
+        : ["build", ...commonArgs];
       const result = await commands.run("docker", args, {
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         ...(dependencies.onOutput === undefined ? {} : { onOutput: (stream: "stdout" | "stderr", text: string) => dependencies.onOutput?.(name, stream, text) }),
@@ -108,13 +125,22 @@ export async function buildDeclaredImages(
       if (result.code !== 0) {
         await rm(nextCache, { recursive: true, force: true });
         await rm(metadataPath, { force: true });
-        throw new Error(`Docker build ${name} failed: ${result.stderr.trim() || result.stdout.trim()}`);
+        const builder = buildxAvailable ? "Buildx" : "classic Docker builder";
+        throw new Error(`Docker build ${name} failed with ${builder}: ${result.stderr.trim() || result.stdout.trim()}`);
       }
-      try { metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>; } catch { /* Optional BuildKit metadata. */ }
-      await rm(metadataPath, { force: true });
-      if (existsSync(nextCache)) {
-        await rm(buildkitCache, { recursive: true, force: true });
-        await rename(nextCache, buildkitCache);
+      metadata = { build_engine: buildxAvailable ? "buildx" : "docker" };
+      if (buildxAvailable) {
+        try {
+          metadata = {
+            ...metadata,
+            ...(JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>),
+          };
+        } catch { /* Optional BuildKit metadata. */ }
+        await rm(metadataPath, { force: true });
+        if (existsSync(nextCache)) {
+          await rm(buildkitCache, { recursive: true, force: true });
+          await rename(nextCache, buildkitCache);
+        }
       }
       await writeBuildState(statePath, {
         version: 1,
@@ -128,6 +154,16 @@ export async function buildDeclaredImages(
     results[name] = { name, image, cacheHit: reusable, fingerprint, metadata };
   }
   return results;
+}
+
+async function hasBuildx(commands: CommandExecutor, signal?: AbortSignal): Promise<boolean> {
+  const result = await commands.run("docker", ["buildx", "version"], signal === undefined ? {} : { signal });
+  if (result.code === 0) return true;
+  const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+  if (/buildx[^\n]*(?:not a docker command|not found|unknown command)|unknown command[^\n]*buildx/i.test(detail)) {
+    return false;
+  }
+  throw new Error(`could not check Docker Buildx availability: ${detail}`);
 }
 
 export async function pruneBuildCache(
@@ -157,53 +193,131 @@ async function buildFingerprint(root: string, context: string, config: BuildConf
     ...extraExcluded.map((path) => resolve(path)),
   ]);
   hash.update(JSON.stringify({ ...config, outputs: [...(config.outputs ?? [])].sort() }));
-  const files = config.inputs === undefined
-    ? await listInputs(context, outputPaths)
-    : await listDeclaredInputs(context, config.inputs, outputPaths);
-  for (const path of files) {
-    hash.update(relative(context, path).split(sep).join("/"));
+  const inputs = config.command === undefined
+    ? await listDockerInputs(context, config)
+    : config.inputs === undefined
+      ? await listInputs(context, outputPaths)
+      : await listDeclaredInputs(context, config.inputs, outputPaths);
+  for (const input of inputs) {
+    hash.update(input.relativePath);
     hash.update("\0");
-    hash.update(await readFile(path));
+    hash.update(inputKind(input.details));
     hash.update("\0");
+    hash.update((input.details.mode & 0o7777).toString(8));
+    hash.update("\0");
+    if (input.details.isFile()) hash.update(await readFile(input.path));
+    else if (input.details.isSymbolicLink()) hash.update(await readlink(input.path));
+    else if (!input.details.isDirectory()) throw new Error(`build input has unsupported type: ${input.relativePath}`);
+    hash.update("\0");
+    if (input.dereferencedContent !== undefined) {
+      hash.update("control-file-content\0");
+      hash.update(input.dereferencedContent);
+      hash.update("\0");
+    }
   }
   return hash.digest("hex");
 }
 
-async function listDeclaredInputs(context: string, inputs: readonly string[], excluded: ReadonlySet<string>): Promise<string[]> {
-  const files = new Set<string>();
-  for (const input of inputs) {
-    const path = resolve(context, input);
-    const withinContext = relative(context, path);
-    if (withinContext.startsWith(".." + sep) || withinContext === ".." || withinContext.startsWith(sep)) {
-      throw new Error(`build input must remain inside its context: ${input}`);
-    }
-    let details;
-    try { details = await lstat(path); } catch { throw new Error(`build input does not exist: ${input}`); }
-    if (details.isSymbolicLink()) throw new Error(`build input may not be a symbolic link: ${input}`);
-    if (details.isDirectory()) {
-      for (const nested of await listInputs(path, excluded)) files.add(nested);
-    } else if (details.isFile() && ![...excluded].some((excludedPath) => path === excludedPath || path.startsWith(excludedPath + sep))) {
-      files.add(path);
-    }
+async function listDockerInputs(context: string, config: BuildConfig): Promise<BuildInput[]> {
+  const dockerfile = resolve(context, config.dockerfile ?? "Dockerfile");
+  pathWithinContext(context, dockerfile, "Dockerfile");
+  const specificIgnore = `${dockerfile}.dockerignore`;
+  const ignorePath = existsSync(specificIgnore)
+    ? specificIgnore
+    : existsSync(join(context, ".dockerignore"))
+      ? join(context, ".dockerignore")
+      : undefined;
+  const matcher = createDockerIgnore({ ignorecase: false });
+  if (ignorePath !== undefined) matcher.add(await readFile(ignorePath, "utf8"));
+
+  // Docker reads these control files even when an ignore rule excludes them.
+  // Hash their dereferenced contents as well as their filesystem entry so a
+  // symlinked Dockerfile or ignore file cannot produce a stale cache hit.
+  const controlFiles = [dockerfile, ...(ignorePath === undefined ? [] : [ignorePath])];
+  // Docker receives the complete context. `inputs` remains useful for command
+  // builds, but cannot safely narrow a Docker fingerprint unless the transmitted
+  // context is narrowed as well.
+  const candidates = await listInputs(context, new Set());
+  const byPath = new Map(candidates.map((input) => [input.path, input]));
+  for (const path of controlFiles) {
+    const [details, dereferencedContent] = await Promise.all([lstat(path), readFile(path)]);
+    byPath.set(path, { path, relativePath: normalizedRelativePath(context, path), details, dereferencedContent });
   }
-  return [...files].sort();
+  const alwaysIncluded = new Set(controlFiles);
+  const filtered = [...byPath.values()].filter((input) =>
+    alwaysIncluded.has(input.path) || !isDockerIgnored(matcher, input.relativePath)
+  );
+  filtered.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+
+  return filtered;
 }
 
-async function listInputs(directory: string, excluded: ReadonlySet<string>): Promise<string[]> {
-  const files: string[] = [];
+function isDockerIgnored(matcher: Ignore, relativePath: string): boolean {
+  return matcher.ignores(relativePath);
+}
+
+async function listDeclaredInputs(context: string, inputs: readonly string[], excluded: ReadonlySet<string>): Promise<BuildInput[]> {
+  const entries = new Map<string, BuildInput>();
+  for (const input of inputs) {
+    const path = resolve(context, input);
+    pathWithinContext(context, path, input);
+    let details;
+    try { details = await lstat(path); } catch { throw new Error(`build input does not exist: ${input}`); }
+    if (details.isDirectory()) {
+      if (!isExcluded(path, excluded)) {
+        if (path !== resolve(context)) {
+          entries.set(path, { path, relativePath: normalizedRelativePath(context, path), details });
+        }
+        for (const nested of await listInputs(path, excluded, context)) entries.set(nested.path, nested);
+      }
+    } else if (!isExcluded(path, excluded)) {
+      entries.set(path, { path, relativePath: normalizedRelativePath(context, path), details });
+    }
+  }
+  return [...entries.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+async function listInputs(
+  directory: string,
+  excluded: ReadonlySet<string>,
+  context = directory,
+): Promise<BuildInput[]> {
+  const inputs: BuildInput[] = [];
   const visit = async (current: string): Promise<void> => {
-    if ([...excluded].some((path) => current === path || current.startsWith(path + sep))) return;
+    if (isExcluded(current, excluded)) return;
     for (const entry of await readdir(current, { withFileTypes: true })) {
-      if (entry.isDirectory() && IGNORED_DIRECTORIES.has(entry.name)) continue;
       const path = join(current, entry.name);
-      if ([...excluded].some((excludedPath) => path === excludedPath || path.startsWith(excludedPath + sep))) continue;
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) await visit(path);
-      else if (entry.isFile()) files.push(path);
+      if (isExcluded(path, excluded)) continue;
+      const details = await lstat(path);
+      inputs.push({ path, relativePath: normalizedRelativePath(context, path), details });
+      if (details.isDirectory()) await visit(path);
     }
   };
   await visit(directory);
-  return files.sort();
+  return inputs.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function pathWithinContext(context: string, path: string, declared: string): string {
+  const withinContext = relative(context, path);
+  if (withinContext.startsWith(".." + sep) || withinContext === ".." || withinContext.startsWith(sep)) {
+    throw new Error(`build input must remain inside its context: ${declared}`);
+  }
+  return withinContext;
+}
+
+function normalizedRelativePath(context: string, path: string): string {
+  return relative(context, path).split(sep).join("/");
+}
+
+function isExcluded(path: string, excluded: ReadonlySet<string>): boolean {
+  return [...excluded].some((excludedPath) => path === excludedPath || path.startsWith(excludedPath + sep));
+}
+
+function inputKind(details: Stats): string {
+  if (details.isFile()) return "file";
+  if (details.isDirectory()) return "directory";
+  if (details.isSymbolicLink()) return "symlink";
+  return "other";
 }
 
 async function readBuildState(path: string): Promise<BuildState | undefined> {

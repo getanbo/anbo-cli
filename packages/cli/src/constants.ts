@@ -18,6 +18,8 @@ export const LIFECYCLE = new Set([
   "test",
   "logs",
   "debug",
+  "run",
+  "reset",
   "down",
   "doctor",
 ]);

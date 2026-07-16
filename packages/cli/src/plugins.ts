@@ -24,6 +24,7 @@ import { CLI_VERSION, EXIT_CODE } from "./constants.js";
 import { savePluginLock } from "./config.js";
 import { AnboError, PluginCompatibilityError, PluginUnavailableError } from "./errors.js";
 import type { EventWriter } from "./events.js";
+import { safeJsonObject, safeJsonValue } from "./json.js";
 import { runProcess } from "./process.js";
 import { createCredentialStore, createStateStore, pluginPaths } from "./storage.js";
 
@@ -150,6 +151,7 @@ export async function executeTarget(input: {
   const project = projectIdentity(input.rootDir);
   const result = normalizeResult(await provider.execute({
     api_version: 1,
+    run_id: input.writer.runId,
     action: input.action,
     project,
     config: input.config,
@@ -180,6 +182,7 @@ export async function executePluginCommand(input: {
   const result = normalizeResult(await command({
     name: input.name,
     command: input.name,
+    run_id: input.writer.runId,
     project: projectIdentity(input.rootDir),
     config: input.config,
     args: input.args,
@@ -291,14 +294,22 @@ async function createPluginContext(
       },
       async startPhase(name, options) {
         const source = options?.source ?? pluginId;
-        writer.emit({ type: "phase.started", source, message: `${name} started`, data: { phase: name } });
+        writer.emit({
+          type: "phase.started",
+          source,
+          message: `${name} started`,
+          data: { phase: safeJsonValue(name) },
+        });
         return {
           async finish(message, fields) {
             writer.emit({
               type: "phase.finished",
               source,
               message: message ?? `${name} finished`,
-              data: { phase: name, ...(fields ? { fields: toJson(fields) } : {}) },
+              data: {
+                phase: safeJsonValue(name),
+                ...(fields ? { fields: safeJsonObject(fields) } : {}),
+              },
             });
           },
           async fail(message, fields) {
@@ -307,13 +318,22 @@ async function createPluginContext(
               source,
               level: "error",
               message,
-              data: { phase: name, ...(fields ? { fields: toJson(fields) } : {}) },
+              data: {
+                phase: safeJsonValue(name),
+                ...(fields ? { fields: safeJsonObject(fields) } : {}),
+              },
             });
           },
         };
       },
     },
-    process: { run: async (command, args, options) => await runProcess(command, args, options, signal) },
+    process: {
+      run: async (command, args, options) => await runProcess(command, args, options, signal),
+      cleanup: async (command, args, options) => await runProcess(command, args, {
+        ...options,
+        timeout_ms: Math.min(options?.timeout_ms ?? 10_000, 10_000),
+      }),
+    },
     http: {
       async request(input, init = {}) {
         const combinedSignal = init.signal ? AbortSignal.any([signal, init.signal]) : signal;
@@ -568,17 +588,29 @@ function normalizeResult(result: TargetResultV1): TargetResultV1 {
 
 function emitDiagnostics(result: TargetResultV1, writer: EventWriter, source: string): void {
   for (const diagnostic of result.diagnostics ?? []) {
+    if (result.status !== "succeeded" && sameDiagnostic(diagnostic, result.failure)) continue;
     writer.emit({
       type: "diagnostic",
-      level: result.status === "failed" ? "error" : "warn",
+      level: diagnostic.level ?? (result.status === "failed" ? "error" : "warn"),
       source,
       message: diagnostic.message,
       data: {
         code: diagnostic.code,
         ...(diagnostic.remediation ? { remediation: diagnostic.remediation } : {}),
+        ...(diagnostic.phase ? { phase: diagnostic.phase } : {}),
+        ...(diagnostic.retryable === undefined ? {} : { retryable: diagnostic.retryable }),
+        ...(diagnostic.safe_to_retry === undefined ? {} : { safe_to_retry: diagnostic.safe_to_retry }),
+        ...(diagnostic.evidence === undefined ? {} : { evidence: safeJsonValue(diagnostic.evidence) }),
       },
     });
   }
+}
+
+function sameDiagnostic(
+  diagnostic: NonNullable<TargetResultV1["diagnostics"]>[number],
+  failure: TargetResultV1["failure"],
+): boolean {
+  return failure !== undefined && diagnostic.code === failure.code && diagnostic.message === failure.message;
 }
 
 function validActions(actions: readonly TargetActionV1[]): boolean {
@@ -628,10 +660,6 @@ function projectIdentity(rootDir: string): TargetRequestV1["project"] {
 
 function sanitizeId(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9-]+/gu, "-").replace(/^-|-$/gu, "") || "project";
-}
-
-function toJson(value: Record<string, unknown>): JsonObject {
-  return JSON.parse(JSON.stringify(value)) as JsonObject;
 }
 
 function isPlugin(value: unknown): value is AnboPluginV1 {

@@ -34,3 +34,9 @@ test("reconcile is a boolean deploy flag and preserves following positionals", (
   assert.equal(alias.target, "ministack");
   assert.equal(alias.flags.reconcile, true);
 });
+
+test("refresh is a boolean configure flag and preserves following positionals", () => {
+  const parsed = parseCliArgs(["configure", "--refresh", "ministack"]);
+  assert.equal(parsed.flags.refresh, true);
+  assert.deepEqual(parsed.positionals, ["ministack"]);
+});

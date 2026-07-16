@@ -76,10 +76,13 @@ not treat them as a security boundary.
 
 ## Platform Notes
 
-On macOS arm64, Anbo selects the certified `linux/amd64` MiniStack manifest and
-uses Docker emulation. MiniStack features that start containers, including
-Lambda, ECS, EKS, RDS, and ElastiCache, also require access to the local Docker
-daemon and may carry their own architecture constraints.
+Anbo reads the Docker server platform rather than inferring it from the Node
+host process. The current runtime manifest certifies `linux/amd64`, so Anbo
+selects that image platform deterministically on both amd64 and arm64 Docker
+servers and uses Docker emulation where necessary. MiniStack features that start
+containers, including Lambda, ECS, EKS, RDS, and ElastiCache, also require
+access to the local Docker daemon and may carry their own architecture
+constraints.
 
 MiniStack fidelity is version-specific. Replacing the certified tag or digest
 is an explicit compatibility change and should be validated through an installed

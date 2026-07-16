@@ -9,6 +9,7 @@ components are not relicensed by this project.
 | [MiniStack](https://github.com/ministackorg/ministack/tree/v1.4.2) | 1.4.2 | [MIT](https://github.com/ministackorg/ministack/blob/v1.4.2/LICENSE) | Docker image pulled at runtime. |
 | [Terraform](https://github.com/hashicorp/terraform/tree/v1.15.7) | 1.15.7 | [Business Source License 1.1](https://github.com/hashicorp/terraform/blob/v1.15.7/LICENSE) | HashiCorp Docker worker pulled at runtime. Terraform 1.15.7 is source-available, not OSI-approved open source. |
 | [Terraform AWS provider](https://github.com/hashicorp/terraform-provider-aws/tree/v6.54.0) | 6.54.0 in the acceptance fixture; project constraints may differ | [MPL-2.0](https://github.com/hashicorp/terraform-provider-aws/blob/v6.54.0/LICENSE) | Downloaded by Terraform at runtime. |
+| [`@balena/dockerignore`](https://github.com/balena-io-modules/dockerignore/tree/v1.0.2) | 1.0.2 | [Apache-2.0](https://github.com/balena-io-modules/dockerignore/blob/v1.0.2/LICENSE) | Bundled runtime parser for Docker-compatible build-context filtering. |
 
 Container base images, project-selected Terraform modules/providers, adapters,
 and application dependencies have their own terms. Review them before use or

@@ -3,7 +3,7 @@ import { cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/pro
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { CommandExecutor, RuntimeCommandOptions, RuntimeCommandResult } from "./ministack.js";
-import { ProcessCommandExecutor } from "./ministack.js";
+import { ProcessCommandExecutor, safeProjectId } from "./ministack.js";
 import { assertTerraformTreeRoot, terraformLockCacheKey, terraformTreePathExcluded } from "./terraform-reconciliation.js";
 
 /** Endpoint names published by MiniStack's Terraform v5/v6 configuration. */
@@ -17,6 +17,7 @@ export const MINISTACK_TERRAFORM_ENDPOINTS = [
 ] as const;
 
 export interface TerraformRunConfig {
+  projectId?: string;
   projectDirectory: string;
   sourceDirectory: string;
   privateDirectory: string;
@@ -66,7 +67,8 @@ export type TerraformLifecyclePhase =
   | "terraform.plan"
   | "terraform.show"
   | "terraform.apply"
-  | "terraform.output";
+  | "terraform.output"
+  | "terraform.cleanup";
 
 export interface TerraformLifecycleEvent {
   phase: TerraformLifecyclePhase;
@@ -76,9 +78,22 @@ export interface TerraformLifecycleEvent {
   reason?: string;
 }
 
+export class TerraformPhaseError extends Error {
+  constructor(readonly phase: TerraformLifecyclePhase, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "TerraformPhaseError";
+  }
+}
+
 interface HostIdentity {
   uid?: number;
   gid?: number;
+}
+
+interface TerraformWorkerSession {
+  containerName: string;
+  startAttempted: boolean;
+  started: boolean;
 }
 
 interface HclToken {
@@ -164,71 +179,123 @@ export async function runTerraform(
     config.region ?? "us-east-1",
     config.accountId ?? "000000000000",
   );
-  await runTerraformWorker(commands, config, ["init", "-input=false", "-no-color"], {
-    environment: initEnvironment,
-    network: "bridge",
-    phase: "terraform.init",
-    onOutput: dependencies.onOutput,
-    onLifecycle: dependencies.onLifecycle,
-  });
-  if (lockCachePath !== undefined) await persistTerraformLock(join(config.privateDirectory, ".terraform.lock.hcl"), lockCachePath);
-  await runTerraformWorker(commands, config, ["validate", "-no-color"], {
-    environment: isolatedEnvironment,
-    network: config.networkName,
-    phase: "terraform.validate",
-    onOutput: dependencies.onOutput,
-    onLifecycle: dependencies.onLifecycle,
-  });
-
-  const planPath = join(config.privateDirectory, ".anbo.plan");
-  const variableArguments = resolveVariableArguments(config);
-  const plan = await runTerraformWorker(commands, config, [
-    "plan", "-input=false", "-no-color", "-compact-warnings", "-detailed-exitcode", "-out=/workspace/.anbo.plan",
-    ...variableArguments,
-  ], {
-    environment: isolatedEnvironment,
-    network: config.networkName,
-    phase: "terraform.plan",
-    allowedExitCodes: [0, 2],
-    onLifecycle: dependencies.onLifecycle,
-  });
-  if (dependencies.onOutput !== undefined) {
-    await dependencies.onOutput("stdout", summarizeTerraformPlan(plan.stdout, plan.code), "terraform.plan");
-  }
-  const changes = plan.code === 0
-    ? emptyChangeSummary()
-    : await inspectTerraformPlan(commands, config, isolatedEnvironment, dependencies.onLifecycle);
-
-  if (plan.code === 0) {
-    await dependencies.onLifecycle?.({
-      phase: "terraform.apply",
-      status: "skipped",
-      durationMs: 0,
-      reason: "terraform_plan_empty",
-    });
-  } else {
-    // Applying the saved filename, rather than re-planning, is a safety invariant.
-    await runTerraformWorker(commands, config, ["apply", "-input=false", "-no-color", "/workspace/.anbo.plan"], {
-      environment: isolatedEnvironment,
-      network: config.networkName,
-      phase: "terraform.apply",
+  const worker: TerraformWorkerSession = {
+    containerName: `anbo-terraform-${randomUUID().replaceAll("-", "")}`,
+    startAttempted: false,
+    started: false,
+  };
+  let primaryFailure: unknown;
+  try {
+    await runTerraformWorker(commands, config, worker, ["init", "-input=false", "-no-color"], {
+      environment: initEnvironment,
+      phase: "terraform.init",
       onOutput: dependencies.onOutput,
       onLifecycle: dependencies.onLifecycle,
     });
+    if (lockCachePath !== undefined) await persistTerraformLock(join(config.privateDirectory, ".terraform.lock.hcl"), lockCachePath);
+    await isolateTerraformWorkerNetwork(commands, config, worker);
+    await runTerraformWorker(commands, config, worker, ["validate", "-no-color"], {
+      environment: isolatedEnvironment,
+      phase: "terraform.validate",
+      onOutput: dependencies.onOutput,
+      onLifecycle: dependencies.onLifecycle,
+    });
+
+    const planPath = join(config.privateDirectory, ".anbo.plan");
+    const variableArguments = resolveVariableArguments(config);
+    const plan = await runTerraformWorker(commands, config, worker, [
+      "plan", "-input=false", "-no-color", "-compact-warnings", "-detailed-exitcode", "-out=/workspace/.anbo.plan",
+      ...variableArguments,
+    ], {
+      environment: isolatedEnvironment,
+      phase: "terraform.plan",
+      allowedExitCodes: [0, 2],
+      onLifecycle: dependencies.onLifecycle,
+    });
+    if (dependencies.onOutput !== undefined) {
+      await dependencies.onOutput("stdout", summarizeTerraformPlan(plan.stdout, plan.code), "terraform.plan");
+    }
+    const changes = plan.code === 0
+      ? emptyChangeSummary()
+      : await inspectTerraformPlan(commands, config, worker, isolatedEnvironment, dependencies.onLifecycle);
+
+    if (plan.code === 0) {
+      await dependencies.onLifecycle?.({
+        phase: "terraform.apply",
+        status: "skipped",
+        durationMs: 0,
+        reason: "terraform_plan_empty",
+      });
+    } else {
+      // Applying the saved filename, rather than re-planning, is a safety invariant.
+      await runTerraformWorker(commands, config, worker, ["apply", "-input=false", "-no-color", "/workspace/.anbo.plan"], {
+        environment: isolatedEnvironment,
+        phase: "terraform.apply",
+        onOutput: dependencies.onOutput,
+        onLifecycle: dependencies.onLifecycle,
+      });
+    }
+    const outputResult = await runTerraformWorker(commands, config, worker, ["output", "-json"], {
+      environment: isolatedEnvironment,
+      phase: "terraform.output",
+      onLifecycle: dependencies.onLifecycle,
+    });
+    return {
+      privateDirectory: config.privateDirectory,
+      planPath,
+      statePath: config.statePath,
+      changes,
+      outputs: parseTerraformOutputs(outputResult.stdout),
+    };
+  } catch (cause) {
+    primaryFailure = cause;
+    throw cause;
+  } finally {
+    try {
+      await removeTerraformWorker(commands, worker);
+    } catch (cleanupFailure) {
+      if (primaryFailure === undefined) throw cleanupFailure;
+      const cleanupMessage = cleanupFailure instanceof Error ? cleanupFailure.message : String(cleanupFailure);
+      if (primaryFailure instanceof Error) {
+        Object.defineProperty(primaryFailure, "cleanupFailure", {
+          configurable: true,
+          value: cleanupFailure,
+        });
+      }
+      // Teardown failure is secondary: report it, but let the original
+      // Terraform or cancellation error keep its phase and exit contract.
+      await Promise.resolve(dependencies.onLifecycle?.({
+        phase: "terraform.cleanup",
+        status: "failed",
+        durationMs: 0,
+        reason: cleanupMessage,
+      })).catch(() => undefined);
+    }
   }
-  const outputResult = await runTerraformWorker(commands, config, ["output", "-json"], {
-    environment: isolatedEnvironment,
-    network: config.networkName,
-    phase: "terraform.output",
-    onLifecycle: dependencies.onLifecycle,
-  });
-  return {
-    privateDirectory: config.privateDirectory,
-    planPath,
-    statePath: config.statePath,
-    changes,
-    outputs: parseTerraformOutputs(outputResult.stdout),
-  };
+}
+
+export async function removeProjectTerraformWorkers(
+  projectId: string,
+  commands: CommandExecutor = new ProcessCommandExecutor(),
+  signal?: AbortSignal,
+): Promise<void> {
+  const options = signal === undefined ? {} : { signal };
+  const listed = await commands.run("docker", [
+    "ps", "-aq",
+    "--filter", `label=anbo.dev/project=${safeProjectId(projectId)}`,
+    "--filter", "label=anbo.dev/component=terraform-worker",
+  ], options);
+  if (listed.code !== 0) {
+    const detail = listed.stderr.trim() || listed.stdout.trim() || `exit code ${listed.code}`;
+    throw new Error(`could not list Terraform workers for cleanup: ${detail}`);
+  }
+  const ids = listed.stdout.split(/\s+/).filter(Boolean);
+  if (ids.length === 0) return;
+  const removed = await commands.run("docker", ["rm", "-f", ...ids], options);
+  if (removed.code !== 0) {
+    const detail = removed.stderr.trim() || removed.stdout.trim() || `exit code ${removed.code}`;
+    throw new Error(`could not remove Terraform workers: ${detail}`);
+  }
 }
 
 function summarizeTerraformPlan(stdout: string, code: number): string {
@@ -349,30 +416,16 @@ export function parseTerraformOutputs(output: string): Record<string, unknown> {
 async function runTerraformWorker(
   commands: CommandExecutor,
   config: TerraformRunConfig,
+  worker: TerraformWorkerSession,
   terraformArgs: readonly string[],
   options: {
     environment: NodeJS.ProcessEnv;
-    network: string;
     phase: string;
     onOutput?: (stream: "stdout" | "stderr", text: string, phase: string) => void | Promise<void>;
     onLifecycle?: (event: TerraformLifecycleEvent) => void | Promise<void>;
     allowedExitCodes?: readonly number[];
   },
 ): Promise<RuntimeCommandResult> {
-  const args = [
-    "run", "--rm", "--network", options.network,
-    ...terraformWorkerUserArguments(),
-    "--label", "anbo.dev/managed=true",
-    "--mount", `type=bind,src=${resolve(config.privateDirectory)},dst=/workspace`,
-    "--mount", `type=bind,src=${resolve(config.pluginCacheDirectory)},dst=/terraform-cache`,
-    "--mount", `type=bind,src=${resolve(dirname(config.statePath))},dst=/anbo-state`,
-    "--workdir", "/workspace",
-    "--env", "HOME=/tmp",
-    "--env", "TF_PLUGIN_CACHE_DIR=/terraform-cache",
-    ...dockerEnvironmentArguments(options.environment),
-    config.workerImage,
-    ...terraformArgs,
-  ];
   const commandOptions: RuntimeCommandOptions = {
     ...(config.signal === undefined ? {} : { signal: config.signal }),
     ...(options.onOutput === undefined ? {} : { onOutput: (stream: "stdout" | "stderr", text: string) => options.onOutput?.(stream, text, options.phase) }),
@@ -382,6 +435,14 @@ async function runTerraformWorker(
   const started = performance.now();
   let result: RuntimeCommandResult | undefined;
   try {
+    if (!worker.started) await startTerraformWorker(commands, config, worker, commandOptions);
+    const args = [
+      "exec",
+      ...dockerEnvironmentArguments(options.environment),
+      worker.containerName,
+      "terraform",
+      ...terraformArgs,
+    ];
     result = await commands.run("docker", args, commandOptions);
     const allowed = options.allowedExitCodes ?? [0];
     if (!allowed.includes(result.code)) {
@@ -402,8 +463,73 @@ async function runTerraformWorker(
       durationMs: elapsedMilliseconds(started),
       ...(result === undefined ? {} : { exitCode: result.code }),
     });
-    throw cause;
+    throw cause instanceof TerraformPhaseError ? cause : new TerraformPhaseError(phase, cause);
   }
+}
+
+async function startTerraformWorker(
+  commands: CommandExecutor,
+  config: TerraformRunConfig,
+  worker: TerraformWorkerSession,
+  options: RuntimeCommandOptions,
+): Promise<void> {
+  const startOptions = options.signal === undefined ? {} : { signal: options.signal };
+  // The daemon can create the named container before the Docker client is
+  // cancelled or loses its response. Cleanup must therefore key off the
+  // attempt, not only a successful client return.
+  worker.startAttempted = true;
+  const result = await commands.run("docker", [
+    "run", "--detach", "--rm", "--name", worker.containerName,
+    "--network", "bridge",
+    ...terraformWorkerUserArguments(),
+    "--label", "anbo.dev/managed=true",
+    "--label", "anbo.dev/component=terraform-worker",
+    ...(config.projectId === undefined ? [] : ["--label", `anbo.dev/project=${safeProjectId(config.projectId)}`]),
+    "--mount", `type=bind,src=${resolve(config.privateDirectory)},dst=/workspace`,
+    "--mount", `type=bind,src=${resolve(config.pluginCacheDirectory)},dst=/terraform-cache`,
+    "--mount", `type=bind,src=${resolve(dirname(config.statePath))},dst=/anbo-state`,
+    "--workdir", "/workspace",
+    "--env", "HOME=/tmp",
+    "--env", "TF_PLUGIN_CACHE_DIR=/terraform-cache",
+    "--entrypoint", "/bin/sh",
+    config.workerImage,
+    "-c", "while :; do sleep 3600; done",
+  ], startOptions);
+  if (result.code !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+    throw new Error(`could not start Terraform worker: ${detail}`);
+  }
+  worker.started = true;
+}
+
+async function isolateTerraformWorkerNetwork(
+  commands: CommandExecutor,
+  config: TerraformRunConfig,
+  worker: TerraformWorkerSession,
+): Promise<void> {
+  if (!worker.started || config.networkName === "bridge") return;
+  const options = config.signal === undefined ? {} : { signal: config.signal };
+  const connected = await commands.run("docker", ["network", "connect", config.networkName, worker.containerName], options);
+  if (connected.code !== 0) {
+    throw new Error(`could not connect Terraform worker to isolated network: ${connected.stderr.trim() || connected.stdout.trim()}`);
+  }
+  const disconnected = await commands.run("docker", ["network", "disconnect", "bridge", worker.containerName], options);
+  if (disconnected.code !== 0) {
+    throw new Error(`could not remove Terraform worker egress network: ${disconnected.stderr.trim() || disconnected.stdout.trim()}`);
+  }
+}
+
+async function removeTerraformWorker(commands: CommandExecutor, worker: TerraformWorkerSession): Promise<void> {
+  if (!worker.startAttempted) return;
+  const removed = await commands.run("docker", ["rm", "-f", worker.containerName], { cleanup: true });
+  if (removed.code !== 0) {
+    const detail = removed.stderr.trim() || removed.stdout.trim() || `exit code ${removed.code}`;
+    if (!/(?:no such|not found)/i.test(detail)) {
+      throw new Error(`could not remove Terraform worker ${worker.containerName}: ${detail}`);
+    }
+  }
+  worker.startAttempted = false;
+  worker.started = false;
 }
 
 async function persistTerraformLock(source: string, destination: string): Promise<void> {
@@ -433,12 +559,12 @@ function currentHostIdentity(): HostIdentity {
 async function inspectTerraformPlan(
   commands: CommandExecutor,
   config: TerraformRunConfig,
+  worker: TerraformWorkerSession,
   environment: NodeJS.ProcessEnv,
   onLifecycle?: (event: TerraformLifecycleEvent) => void | Promise<void>,
 ): Promise<TerraformChangeSummary> {
-  const result = await runTerraformWorker(commands, config, ["show", "-json", "/workspace/.anbo.plan"], {
+  const result = await runTerraformWorker(commands, config, worker, ["show", "-json", "/workspace/.anbo.plan"], {
     environment,
-    network: config.networkName,
     phase: "terraform.show",
     ...(onLifecycle === undefined ? {} : { onLifecycle }),
   });
@@ -470,7 +596,7 @@ async function runLifecycleStep<T>(
     return result;
   } catch (cause) {
     await onLifecycle?.({ phase, status: "failed", durationMs: elapsedMilliseconds(started) });
-    throw cause;
+    throw cause instanceof TerraformPhaseError ? cause : new TerraformPhaseError(phase, cause);
   }
 }
 

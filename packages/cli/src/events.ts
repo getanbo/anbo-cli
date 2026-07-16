@@ -6,6 +6,7 @@ import type {
   PluginEventV1,
 } from "@getanbo/plugin-sdk";
 import { ANBO_EVENT_API_VERSION } from "@getanbo/plugin-sdk";
+import { safeJsonObject, safeJsonValue } from "./json.js";
 import { redactObject, redactText } from "./redaction.js";
 
 export interface EventInput {
@@ -51,7 +52,7 @@ export class EventWriter {
       type: input.type,
       level: input.level ?? "info",
       ...(input.message ? { message: redactText(input.message, this.secretValues) } : {}),
-      ...(input.data ? { data: redactObject(input.data, this.secretValues) } : {}),
+      ...(input.data ? { data: redactObject(safeJsonObject(input.data), this.secretValues) } : {}),
     };
     this.events.push(event);
     if (event.type === "run.finished") this.finished = true;
@@ -62,12 +63,12 @@ export class EventWriter {
 
   emitPlugin(event: PluginEventV1): void {
     const data: JsonObject = {
-      ...(event.phase ? { phase: event.phase } : {}),
-      ...(event.service ? { service: event.service } : {}),
-      ...(event.test_id ? { test_id: event.test_id } : {}),
-      ...(event.correlation_id ? { correlation_id: event.correlation_id } : {}),
-      ...(event.fields ? { fields: toJsonObject(event.fields) } : {}),
-      ...(event.data ? toJsonObject(event.data) : {}),
+      ...(event.phase ? { phase: safeJsonValue(event.phase) } : {}),
+      ...(event.service ? { service: safeJsonValue(event.service) } : {}),
+      ...(event.test_id ? { test_id: safeJsonValue(event.test_id) } : {}),
+      ...(event.correlation_id ? { correlation_id: safeJsonValue(event.correlation_id) } : {}),
+      ...(event.fields ? { fields: safeJsonObject(event.fields) } : {}),
+      ...(event.data ? safeJsonObject(event.data) : {}),
     };
     this.emit({
       type: event.kind ?? event.type ?? "plugin.event",
@@ -110,8 +111,4 @@ export class EventWriter {
       this.writeOut(`     ${event.data.remediation}\n`);
     }
   }
-}
-
-function toJsonObject(value: Record<string, unknown>): JsonObject {
-  return JSON.parse(JSON.stringify(value)) as JsonObject;
 }

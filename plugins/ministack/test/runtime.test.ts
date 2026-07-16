@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import type { PluginContextV1 } from "@getanbo/plugin-sdk";
 import { classifyRuntimeError, runDeploy } from "../src/deploy.js";
 import { PluginEventSink } from "../src/event-sink.js";
 import { buildDeclaredImages, pruneBuildCache } from "../src/runtime/cache.js";
-import { acquireClone, acquireConfiguredClones, readCloneState } from "../src/runtime/clones.js";
+import { AmbiguousCloneCreateError, acquireClone, acquireConfiguredClones, readCloneState } from "../src/runtime/clones.js";
 import {
   resolveMiniStackImage,
   startMiniStack,
@@ -29,6 +29,7 @@ import {
   type ServiceRuntimeContext,
 } from "../src/runtime/services.js";
 import {
+  removeProjectTerraformWorkers,
   runTerraform,
   scrubTerraformEnvironment,
   terraformWorkerUserArguments,
@@ -49,6 +50,7 @@ class RecordingExecutor implements CommandExecutor {
 
   async run(command: string, args: readonly string[], options?: RuntimeCommandOptions): Promise<RuntimeCommandResult> {
     this.calls.push({ command, args: [...args], ...(options === undefined ? {} : { options }) });
+    if (args[0] === "version") return { code: 0, stdout: "linux/amd64\n", stderr: "" };
     return await this.responder(command, args, options);
   }
 }
@@ -58,6 +60,7 @@ class IncrementalDeployExecutor implements CommandExecutor {
   readonly terraformCommands: Array<{ command: string; stateKey: string }> = [];
   planCode: 0 | 2 = 2;
   failApplicationNetwork = false;
+  failTerraformCommand?: string;
   private containerExists = false;
   private containerRunning = true;
   private containerId = "ministack-container-1";
@@ -67,12 +70,14 @@ class IncrementalDeployExecutor implements CommandExecutor {
   private hostPort = "4566";
   private controlNetwork = "";
   private runtimeNetwork = "";
+  private terraformStateDirectory = "";
   private stateSerial = 0;
   private generationSerial = 1;
   private containerSerial = 1;
 
   async run(command: string, args: readonly string[], options?: RuntimeCommandOptions): Promise<RuntimeCommandResult> {
     this.calls.push({ command, args: [...args], ...(options === undefined ? {} : { options }) });
+    if (args[0] === "version") return { code: 0, stdout: "linux/amd64\n", stderr: "" };
     if (args[0] === "network" && args[1] === "inspect") {
       if (this.failApplicationNetwork && args[2]?.endsWith("-app") === true) {
         return { code: 1, stdout: "", stderr: "missing" };
@@ -96,6 +101,13 @@ class IncrementalDeployExecutor implements CommandExecutor {
         ? { code: 0, stdout: this.inspection(), stderr: "" }
         : { code: 1, stdout: "", stderr: "No such container" };
     }
+    if (args[0] === "run" && args.includes("anbo.dev/component=terraform-worker")) {
+      const stateMount = args.find((value) => value.startsWith("type=bind,src=") && value.endsWith(",dst=/anbo-state"));
+      assert.ok(stateMount);
+      this.terraformStateDirectory = stateMount.slice("type=bind,src=".length, -",dst=/anbo-state".length);
+      return { code: 0, stdout: "terraform-worker\n", stderr: "" };
+    }
+    if (args[0] === "exec" && args.includes("terraform")) return await this.runTerraform(args);
     if (args[0] === "run" && args.includes("--rm")) return await this.runTerraform(args);
     if (args[0] === "run" && args.includes("--detach") && args.some((value) => value.endsWith("-ministack"))) {
       this.containerExists = true;
@@ -140,10 +152,15 @@ class IncrementalDeployExecutor implements CommandExecutor {
     const command = ["init", "validate", "plan", "show", "apply", "output"].find((candidate) => args.includes(candidate));
     assert.ok(command);
     const stateMount = args.find((value) => value.startsWith("type=bind,src=") && value.endsWith(",dst=/anbo-state"));
-    assert.ok(stateMount);
-    const stateDirectory = stateMount.slice("type=bind,src=".length, -",dst=/anbo-state".length);
+    const stateDirectory = stateMount === undefined
+      ? this.terraformStateDirectory
+      : stateMount.slice("type=bind,src=".length, -",dst=/anbo-state".length);
+    assert.ok(stateDirectory);
     const stateKey = stateDirectory.split("/").at(-1) ?? "unknown";
     this.terraformCommands.push({ command, stateKey });
+    if (command === this.failTerraformCommand) {
+      return { code: 1, stdout: "", stderr: `${command} failed in production runtime` };
+    }
     if (command === "plan") return {
       code: this.planCode,
       stdout: this.planCode === 0 ? "No changes.\n" : "Plan: 1 to add, 0 to change, 0 to destroy.\n",
@@ -443,6 +460,23 @@ test("runtime cleanup reports Docker failures and forwards cancellation", async 
   assert.equal(ministack.calls.every((call) => call.options?.signal === controller.signal), true);
 });
 
+test("runtime cleanup removes project Terraform workers even when they only use bridge", async () => {
+  const controller = new AbortController();
+  const executor = new RecordingExecutor(async (_command, args) => {
+    if (args[0] === "ps") return { code: 0, stdout: "bridge-worker-id\n", stderr: "" };
+    if (args[0] === "rm") return { code: 0, stdout: "bridge-worker-id\n", stderr: "" };
+    return { code: 1, stdout: "", stderr: "unexpected command" };
+  });
+
+  await removeProjectTerraformWorkers("checkout", executor, controller.signal);
+  const listed = executor.calls.find((call) => call.args[0] === "ps");
+  assert.ok(listed?.args.includes("label=anbo.dev/project=checkout"));
+  assert.ok(listed?.args.includes("label=anbo.dev/component=terraform-worker"));
+  const removed = executor.calls.find((call) => call.args[0] === "rm");
+  assert.deepEqual(removed?.args, ["rm", "-f", "bridge-worker-id"]);
+  assert.equal(executor.calls.every((call) => call.options?.signal === controller.signal), true);
+});
+
 test("cache prune fails when managed images cannot be removed", async () => {
   const executor = new RecordingExecutor(async (_command, args) => args[1] === "ls"
     ? { code: 0, stdout: "image-id\n", stderr: "" }
@@ -492,6 +526,25 @@ test("runtime errors preserve lock and Docker prerequisite exit contracts", () =
   const daemon = classifyRuntimeError(new Error("Cannot connect to the Docker daemon. Is the docker daemon running?"), "build");
   assert.equal(daemon.exitCode, ExitCode.Prerequisite);
   assert.equal(daemon.code, "ANBO_DOCKER_UNAVAILABLE");
+
+  const uncertainClone = classifyRuntimeError(
+    new AmbiguousCloneCreateError("postgres", "checkout-postgres", new Error("connection reset")),
+    "clone",
+  );
+  assert.equal(uncertainClone.code, "ANBO_CLONE_CREATE_UNCERTAIN");
+  assert.equal(uncertainClone.details?.retryable, true);
+  assert.equal(uncertainClone.details?.safe_to_retry, false);
+  assert.deepEqual(uncertainClone.details?.evidence, { branch_name: "checkout-postgres" });
+  const cancelledCreate = new AbortController();
+  cancelledCreate.abort(new DOMException("cancelled during create", "AbortError"));
+  const uncertainCancellation = classifyRuntimeError(
+    new AmbiguousCloneCreateError("postgres", "checkout-postgres", cancelledCreate.signal.reason),
+    "clone",
+    cancelledCreate.signal,
+  );
+  assert.equal(uncertainCancellation.exitCode, ExitCode.Cancelled);
+  assert.equal(uncertainCancellation.code, "ANBO_CLONE_CREATE_UNCERTAIN");
+  assert.equal(uncertainCancellation.details?.safe_to_retry, false);
 });
 
 test("external clone state contains metadata and never the PostgreSQL URL", async () => {
@@ -569,6 +622,145 @@ test("anbo-cloud acquires independent PostgreSQL and DynamoDB branches without p
     assert.equal(persisted.includes(secret), false, `state contained ${secret}`);
   }
   assert.deepEqual(Object.keys((await readCloneState(statePath))?.clones ?? {}).sort(), ["dynamodb", "postgres"]);
+});
+
+test("cloud clone ownership is durable before readiness polling and prevents duplicate creation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-cloud-clone-recovery-test-"));
+  const statePath = join(directory, "clones.json");
+  let createCount = 0;
+  let pollingFails = true;
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/v1/branches" && init?.method === "POST") {
+      createCount += 1;
+      return Response.json({
+        id: "postgres-recoverable-id",
+        name: "checkout-postgres",
+        status: "creating",
+        ready: false,
+        source: { type: "postgres", link: "pg-production" },
+        expires_at: "2099-01-01T00:00:00.000Z",
+      }, { status: 201 });
+    }
+    if (path === "/v1/branches/postgres-recoverable-id") {
+      if (pollingFails) throw new Error("transient polling failure");
+      return Response.json({
+        id: "postgres-recoverable-id",
+        name: "checkout-postgres",
+        status: "ready",
+        ready: true,
+        source: { type: "postgres", link: "pg-production" },
+        expires_at: "2099-01-01T00:00:00.000Z",
+      });
+    }
+    if (path.endsWith("/url")) {
+      return Response.json({ database_url: "postgresql://agent:recovered@db.example/demo?sslmode=require" });
+    }
+    return Response.json({ error: "not found" }, { status: 404 });
+  };
+  const request = {
+    projectId: "checkout",
+    engine: "postgres" as const,
+    config: { provider: "anbo-cloud" as const, source: "pg-production" },
+    statePath,
+    environment: { ANBO_TOKEN: "opaque-cloud-token" },
+    apiUrl: "https://api.example",
+    tokenReference: "env://ANBO_TOKEN" as const,
+  };
+
+  await assert.rejects(acquireClone(request, { fetch: fetcher, sleep: async () => {} }), /transient polling failure/);
+  assert.equal((await readCloneState(statePath))?.clones.postgres?.branch_id, "postgres-recoverable-id");
+
+  pollingFails = false;
+  const recovered = await acquireClone(request, { fetch: fetcher, sleep: async () => {} });
+  assert.equal(recovered.metadata.branch_id, "postgres-recoverable-id");
+  assert.equal(createCount, 1);
+});
+
+test("caller cancellation stops clone polling only after ownership is durable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-cloud-clone-cancel-test-"));
+  const statePath = join(directory, "clones.json");
+  const readiness = new AbortController();
+  const cancellation = new DOMException("sibling setup failed", "AbortError");
+  let createCount = 0;
+  let pollCount = 0;
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/v1/branches" && init?.method === "POST") {
+      createCount += 1;
+      return Response.json({
+        id: "postgres-cancelled-id",
+        name: "checkout-postgres",
+        status: "creating",
+        ready: false,
+        source: { type: "postgres", link: "pg-production" },
+        expires_at: "2099-01-01T00:00:00.000Z",
+      }, { status: 201 });
+    }
+    pollCount += 1;
+    return Response.json({ error: "polling should have been cancelled" }, { status: 500 });
+  };
+
+  await assert.rejects(acquireClone({
+    projectId: "checkout",
+    engine: "postgres",
+    config: { provider: "anbo-cloud", source: "pg-production" },
+    statePath,
+    environment: { ANBO_TOKEN: "opaque-cloud-token" },
+    apiUrl: "https://api.example",
+    tokenReference: "env://ANBO_TOKEN",
+    signal: readiness.signal,
+  }, {
+    fetch: fetcher,
+    sleep: async () => { readiness.abort(cancellation); },
+  }), (error: unknown) => error === cancellation);
+
+  assert.equal(createCount, 1);
+  assert.equal(pollCount, 0);
+  assert.equal((await readCloneState(statePath))?.clones.postgres?.branch_id, "postgres-cancelled-id");
+});
+
+test("dual-engine clone failure waits for an in-flight sibling create to persist ownership", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-cloud-clone-sibling-test-"));
+  const statePath = join(directory, "clones.json");
+  let dynamoCreateFinished = false;
+  let pollCount = 0;
+  const fetcher: typeof fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const body = init?.body === undefined ? {} : JSON.parse(String(init.body)) as Record<string, unknown>;
+    if (path === "/v1/branches" && init?.method === "POST" && body["from"] === "pg-production") {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      throw new Error("PostgreSQL clone create failed");
+    }
+    if (path === "/v1/branches" && init?.method === "POST" && body["from"] === "ddb-production") {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      dynamoCreateFinished = true;
+      return Response.json({
+        id: "dynamodb-durable-id",
+        name: "checkout-dynamodb",
+        status: "creating",
+        ready: false,
+        source: { type: "dynamodb", link: "ddb-production" },
+        expires_at: "2099-01-01T00:00:00.000Z",
+      }, { status: 201 });
+    }
+    pollCount += 1;
+    return Response.json({ error: "unexpected poll" }, { status: 500 });
+  };
+
+  await assert.rejects(acquireConfiguredClones({
+    projectId: "checkout",
+    statePath,
+    environment: { ANBO_TOKEN: "opaque-cloud-token" },
+    apiUrl: "https://api.example",
+    tokenReference: "env://ANBO_TOKEN",
+    postgres: { provider: "anbo-cloud", source: "pg-production" },
+    dynamodb: { provider: "anbo-cloud", source: "ddb-production", region: "us-east-1" },
+  }, { fetch: fetcher }), /PostgreSQL clone create failed/);
+
+  assert.equal(dynamoCreateFinished, true, "the aggregate must not reject before its create request settles");
+  assert.equal(pollCount, 0);
+  assert.equal((await readCloneState(statePath))?.clones.dynamodb?.branch_id, "dynamodb-durable-id");
 });
 
 test("standalone test refreshes clone credentials for Lambda overlays and smoke tests without persisting them", async (t) => {
@@ -912,11 +1104,11 @@ test("Terraform applies exactly the saved plan inside the isolated Docker networ
   assert.ok(apply?.args.includes("/workspace/.anbo.plan"));
   assert.equal(executor.calls.some((call) => call.args.join(" ").includes("must-not-appear")), false);
   const plan = executor.calls.find((call) => call.args.includes("plan"));
-  assert.ok(plan?.args.includes("anbo-control"));
+  assert.ok(executor.calls.some((call) => call.args[0] === "network" && call.args[1] === "connect" && call.args[2] === "anbo-control"));
   assert.ok(plan?.args.includes("-var-file=/workspace/vars/local.tfvars"));
   const workerCalls = executor.calls.filter((call) => call.args[0] === "run");
   const expectedUserArguments = terraformWorkerUserArguments();
-  assert.ok(workerCalls.length > 0);
+  assert.equal(workerCalls.length, 1, "a Terraform reconciliation should reuse one worker container");
   for (const call of workerCalls) {
     const userIndex = call.args.indexOf("--user");
     if (expectedUserArguments.length === 0) assert.equal(userIndex, -1);
@@ -930,9 +1122,10 @@ test("Terraform applies exactly the saved plan inside the isolated Docker networ
   assert.equal(outputPhases.includes("terraform.show"), false);
   assert.equal(outputPhases.includes("terraform.output"), false);
   const workerSequence = executor.calls
-    .filter((call) => call.args[0] === "run")
+    .filter((call) => call.args[0] === "exec" && call.args.includes("terraform"))
     .map((call) => ["init", "validate", "plan", "show", "apply", "output"].find((command) => call.args.includes(command)));
   assert.deepEqual(workerSequence, ["init", "validate", "plan", "show", "apply", "output"]);
+  assert.ok(executor.calls.some((call) => call.args.slice(0, 3).join(" ") === "network disconnect bridge"));
   for (const phase of ["terraform.workspace.prepare", "terraform.init", "terraform.validate", "terraform.plan", "terraform.show", "terraform.apply", "terraform.output"]) {
     assert.ok(lifecycle.some((event) => event.phase === phase && event.status === "started"));
     const completed = lifecycle.find((event) => event.phase === phase && event.status === "succeeded");
@@ -1012,6 +1205,117 @@ test("Terraform command failures emit metadata-only monotonic lifecycle events",
   assert.ok(Number.isSafeInteger(failed?.durationMs) && failed!.durationMs! >= 0);
   assert.equal(JSON.stringify(failed).includes("forbidden-secret-value"), false);
   assert.equal(executor.calls.some((call) => call.args.includes("plan") || call.args.includes("apply") || call.args.includes("output")), false);
+  assert.ok(executor.calls.some((call) => call.args[0] === "rm" && call.args[1] === "-f" && call.args[2]?.startsWith("anbo-terraform-")));
+});
+
+test("Terraform cleanup preserves the primary failure and reports teardown separately", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-terraform-cleanup-failure-"));
+  const source = join(directory, "source");
+  await mkdir(source);
+  await writeFile(join(source, "main.tf"), `resource "aws_s3_bucket" "notes" {}\n`);
+  const lifecycle: TerraformLifecycleEvent[] = [];
+  const executor = new RecordingExecutor(async (_command, args, options) => {
+    if (args.includes("validate")) return { code: 1, stdout: "", stderr: "primary validation failure" };
+    if (args[0] === "rm" && args[1] === "-f") {
+      assert.equal(options?.cleanup, true);
+      assert.equal(options?.signal, undefined);
+      return { code: 1, stdout: "", stderr: "cleanup permission denied" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  await assert.rejects(runTerraform({
+    projectDirectory: directory,
+    sourceDirectory: source,
+    privateDirectory: join(directory, "private"),
+    statePath: join(directory, "state", "terraform.tfstate"),
+    pluginCacheDirectory: join(directory, "plugins"),
+    workerImage: `hashicorp/terraform@sha256:${"b".repeat(64)}`,
+    networkName: "anbo-control",
+    miniStackEndpoint: "http://ministack:4566",
+  }, {
+    commands: executor,
+    onLifecycle: async (event) => { lifecycle.push(event); },
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /primary validation failure/);
+    const cleanupFailure = (error as Error & { cleanupFailure?: unknown }).cleanupFailure;
+    assert.ok(cleanupFailure instanceof Error);
+    assert.match(cleanupFailure.message, /cleanup permission denied/);
+    return true;
+  });
+
+  assert.ok(lifecycle.some((event) => event.phase === "terraform.cleanup" &&
+    event.status === "failed" && /cleanup permission denied/.test(event.reason ?? "")));
+});
+
+test("Terraform worker teardown is not cancelled with the failed operation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-terraform-cancel-cleanup-"));
+  const source = join(directory, "source");
+  await mkdir(source);
+  await writeFile(join(source, "main.tf"), `resource "aws_s3_bucket" "notes" {}\n`);
+  const controller = new AbortController();
+  const cancellation = new DOMException("cancelled during validate", "AbortError");
+  const executor = new RecordingExecutor(async (_command, args, options) => {
+    if (args.includes("validate")) {
+      controller.abort(cancellation);
+      throw cancellation;
+    }
+    if (args[0] === "rm" && args[1] === "-f") {
+      assert.equal(options?.cleanup, true);
+      assert.equal(options?.signal, undefined);
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  await assert.rejects(runTerraform({
+    projectDirectory: directory,
+    sourceDirectory: source,
+    privateDirectory: join(directory, "private"),
+    statePath: join(directory, "state", "terraform.tfstate"),
+    pluginCacheDirectory: join(directory, "plugins"),
+    workerImage: `hashicorp/terraform@sha256:${"b".repeat(64)}`,
+    networkName: "anbo-control",
+    miniStackEndpoint: "http://ministack:4566",
+    signal: controller.signal,
+  }, { commands: executor }), (error: unknown) => error instanceof Error && error.cause === cancellation);
+
+  assert.ok(executor.calls.some((call) => call.args[0] === "rm" && call.options?.cleanup === true));
+});
+
+test("Terraform removes a named worker when the Docker start response is interrupted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-terraform-start-interrupted-"));
+  const source = join(directory, "source");
+  await mkdir(source);
+  await writeFile(join(source, "main.tf"), `resource "aws_s3_bucket" "notes" {}\n`);
+  const interruption = new DOMException("Docker client cancelled after create", "AbortError");
+  let attemptedName: string | undefined;
+  const executor = new RecordingExecutor(async (_command, args, options) => {
+    if (args[0] === "run" && args.includes("anbo.dev/component=terraform-worker")) {
+      attemptedName = args[args.indexOf("--name") + 1];
+      throw interruption;
+    }
+    if (args[0] === "rm" && args[1] === "-f") {
+      assert.equal(args[2], attemptedName);
+      assert.equal(options?.cleanup, true);
+      return { code: 0, stdout: attemptedName ?? "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  await assert.rejects(runTerraform({
+    projectDirectory: directory,
+    sourceDirectory: source,
+    privateDirectory: join(directory, "private"),
+    statePath: join(directory, "state", "terraform.tfstate"),
+    pluginCacheDirectory: join(directory, "plugins"),
+    workerImage: `hashicorp/terraform@sha256:${"b".repeat(64)}`,
+    networkName: "anbo-control",
+    miniStackEndpoint: "http://ministack:4566",
+  }, { commands: executor }), (error: unknown) => error instanceof Error && error.cause === interruption);
+
+  assert.match(attemptedName ?? "", /^anbo-terraform-/);
+  assert.ok(executor.calls.some((call) => call.args.join(" ") === `rm -f ${attemptedName}`));
 });
 
 test("Terraform reuses only init-augmented locks derived from the same source lock", async () => {
@@ -1023,15 +1327,18 @@ test("Terraform reuses only init-augmented locks derived from the same source lo
   await writeFile(join(source, "main.tf"), `output "name" { value = "notes" }\n`);
   await writeFile(join(source, ".terraform.lock.hcl"), "source-lock-v1\n");
   const locksSeenByInit: Array<string | undefined> = [];
+  let workerWorkspace = "";
   const executor = new RecordingExecutor(async (_command, args) => {
     const workspaceMount = args.find((value) => value.startsWith("type=bind,src=") && value.endsWith(",dst=/workspace"));
-    assert.ok(workspaceMount);
-    const workspace = workspaceMount.slice("type=bind,src=".length, -",dst=/workspace".length);
+    if (workspaceMount !== undefined) {
+      workerWorkspace = workspaceMount.slice("type=bind,src=".length, -",dst=/workspace".length);
+    }
     if (args.includes("init")) {
+      assert.ok(workerWorkspace);
       let lock: string | undefined;
-      try { lock = await readFile(join(workspace, ".terraform.lock.hcl"), "utf8"); } catch { /* No source lock. */ }
+      try { lock = await readFile(join(workerWorkspace, ".terraform.lock.hcl"), "utf8"); } catch { /* No source lock. */ }
       locksSeenByInit.push(lock);
-      await writeFile(join(workspace, ".terraform.lock.hcl"), "init-augmented-lock-v1\n");
+      await writeFile(join(workerWorkspace, ".terraform.lock.hcl"), "init-augmented-lock-v1\n");
     }
     if (args.includes("plan")) return { code: 0, stdout: "No changes.\n", stderr: "" };
     if (args.includes("output")) return { code: 0, stdout: "{}", stderr: "" };
@@ -1208,6 +1515,72 @@ test("Terraform reconciliation fingerprints all semantic tree and runtime inputs
   assert.throws(() => terraformRootStateKey(source, "../copied"), /must remain inside the project/);
 });
 
+test("Terraform tree hash cache avoids unchanged content reads and selectively rehashes changes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-terraform-hash-cache-"));
+  const source = join(directory, "source");
+  const cacheDirectory = join(directory, "private-cache");
+  const cachePath = join(cacheDirectory, "tree-v1.json");
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, "main.tf"), `output "name" { value = var.name }\n`);
+  await writeFile(join(source, "variables.tf"), `variable "name" {}\n`);
+
+  const contentReads: string[] = [];
+  const fingerprint = async (): Promise<string> => await terraformReconciliationFingerprint({
+    projectDirectory: source,
+    sourceDirectory: source,
+    root: ".",
+    variableFiles: [],
+    workerImage: `hashicorp/terraform@sha256:${"b".repeat(64)}`,
+    stateIdentity: { key: "root-state-key", filename: "terraform.tfstate" },
+    miniStack: {
+      containerName: "anbo-cache-test-ministack",
+      containerId: "container-1",
+      runtimeGeneration: "generation-1",
+      networkName: "anbo-cache-test-control",
+      containerEndpoint: "http://anbo-cache-test-ministack:4566",
+      image: `ministack@sha256:${"a".repeat(64)}`,
+      profile: "full",
+      persistence: true,
+    },
+    terraform: { region: "us-east-1", accountId: "000000000000" },
+  }, {
+    treeHashCachePath: cachePath,
+    readContent: async (path) => {
+      contentReads.push(path);
+      return await readFile(path);
+    },
+  });
+
+  const baseline = await fingerprint();
+  assert.deepEqual(contentReads.map((path) => path.slice(source.length + 1)).sort(), ["main.tf", "variables.tf"]);
+  contentReads.length = 0;
+  assert.equal(await fingerprint(), baseline);
+  assert.equal(contentReads.length, 0, "an unchanged warm fingerprint must perform zero source-content reads");
+
+  const touched = new Date(Date.now() + 2_000);
+  await utimes(join(source, "main.tf"), touched, touched);
+  contentReads.length = 0;
+  assert.equal(await fingerprint(), baseline, "metadata-only touches must not change the content-based fingerprint");
+  assert.deepEqual(contentReads.map((path) => path.slice(source.length + 1)), ["main.tf"]);
+
+  await writeFile(join(source, "variables.tf"), `variable "zone" {}\n`);
+  contentReads.length = 0;
+  const changed = await fingerprint();
+  assert.notEqual(changed, baseline, "a same-size content change must invalidate the fingerprint");
+  assert.deepEqual(
+    contentReads.map((path) => path.slice(source.length + 1)),
+    ["variables.tf"],
+    "only the file with changed metadata should be rehashed",
+  );
+
+  await writeFile(cachePath, "{ malformed cache");
+  contentReads.length = 0;
+  assert.equal(await fingerprint(), changed, "a malformed cache must degrade to a correct cold content scan");
+  assert.deepEqual(contentReads.map((path) => path.slice(source.length + 1)).sort(), ["main.tf", "variables.tf"]);
+  assert.equal((await stat(cacheDirectory)).mode & 0o777, 0o700);
+  assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
+});
+
 test("Terraform worker identity mapping is portable and rejects invalid host IDs", () => {
   assert.deepEqual(terraformWorkerUserArguments({ uid: 1001, gid: 121 }), ["--user", "1001:121"]);
   assert.deepEqual(terraformWorkerUserArguments({}), []);
@@ -1274,9 +1647,10 @@ test("runtime binding detection leaves static service test loops untouched", asy
   assert.equal(executor.calls.length, 0);
 });
 
-test("unchanged Docker builds are skipped and Terraform outputs are exported predictably", async () => {
+test("Docker build reuse covers the complete effective context and Terraform outputs are exported predictably", async () => {
   const directory = await mkdtemp(join(tmpdir(), "anbo-build-test-"));
   await writeFile(join(directory, "Dockerfile"), "FROM scratch\n");
+  await writeFile(join(directory, ".dockerignore"), "cache\n");
   await writeFile(join(directory, "notes.txt"), "unrelated\n");
   const executor = new RecordingExecutor(async () => ({ code: 0, stdout: "#1 CACHED\n", stderr: "" }));
   const built = await buildDeclaredImages({
@@ -1286,18 +1660,26 @@ test("unchanged Docker builds are skipped and Terraform outputs are exported pre
     cacheRoot: join(directory, "cache"),
   }, { commands: executor });
   assert.equal(built.api?.cacheHit, false);
-  const buildArgs = executor.calls.find((call) => call.args.includes("buildx"))?.args ?? [];
+  const buildArgs = executor.calls.find((call) => call.args[0] === "buildx" && call.args[1] === "build")?.args ?? [];
   assert.ok(buildArgs.includes("--cache-to"));
   const buildCalls = executor.calls.length;
-  await writeFile(join(directory, "notes.txt"), "still unrelated\n");
-  const reused = await buildDeclaredImages({
+  const unchanged = await buildDeclaredImages({
     projectId: "checkout",
     root: directory,
     builds: { api: { context: ".", inputs: ["Dockerfile"] } },
     cacheRoot: join(directory, "cache"),
   }, { commands: executor });
-  assert.equal(reused.api?.cacheHit, true);
+  assert.equal(unchanged.api?.cacheHit, true);
   assert.equal(executor.calls.length, buildCalls + 1, "only docker image inspect should run on a cache hit");
+
+  await writeFile(join(directory, "notes.txt"), "still unrelated\n");
+  const rebuiltForContext = await buildDeclaredImages({
+    projectId: "checkout",
+    root: directory,
+    builds: { api: { context: ".", inputs: ["Dockerfile"] } },
+    cacheRoot: join(directory, "cache"),
+  }, { commands: executor });
+  assert.equal(rebuiltForContext.api?.cacheHit, false, "declared inputs cannot hide files sent to Docker");
 
   await writeFile(join(directory, "Dockerfile"), "FROM scratch\nLABEL changed=true\n");
   const rebuilt = await buildDeclaredImages({
@@ -1321,6 +1703,97 @@ test("unchanged Docker builds are skipped and Terraform outputs are exported pre
   assert.equal(environment.API_URL, "http://api.example");
   assert.equal(environment.ANBO_TERRAFORM_OUTPUT_API_URL, "http://api.example");
   assert.equal(environment.ANBO_TERRAFORM_OUTPUT_ORDER_TABLE, "orders");
+});
+
+test("deploy preserves the exact production Terraform failure phase in state and diagnostics", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-terraform-phase-deploy-"));
+  const project = join(directory, "project");
+  const stateHome = join(directory, "state");
+  await mkdir(join(project, "infra"), { recursive: true });
+  await writeFile(join(project, "infra", "main.tf"), `resource "aws_s3_bucket" "notes" {}\n`);
+  const manifest = minimalManifest();
+  manifest.terraform.roots = ["infra"];
+  const executor = new IncrementalDeployExecutor();
+  executor.failTerraformCommand = "validate";
+
+  await assert.rejects(runDeploy({
+    root: project,
+    runtimeProjectId: "terraform-phase-runtime",
+    manifestPath: join(project, ".anbo", "sandbox.json"),
+    manifest,
+    action: "deploy",
+    args: [],
+    flags: { "no-test": true },
+    env: {},
+    stateHome,
+    cacheHome: join(directory, "cache"),
+    commands: executor,
+    fetch: async () => Response.json({ edition: "full" }),
+  }, eventSink()), (error: unknown) => {
+    assert.ok(error instanceof AnboError);
+    assert.equal(error.code, "ANBO_TERRAFORM_VALIDATE_FAILED");
+    assert.equal(error.details?.phase, "terraform.validate");
+    return true;
+  });
+
+  const supervisor = new ProjectSupervisor({
+    projectRoot: project,
+    projectId: "terraform-phase-runtime",
+    logicalProjectId: manifest.project.name,
+    projectName: manifest.project.name,
+    stateHome,
+  });
+  const failure = ((await supervisor.readState()) as Record<string, unknown> | undefined)?.["last_failure"] as Record<string, unknown>;
+  assert.equal(failure["code"], "ANBO_TERRAFORM_VALIDATE_FAILED");
+  assert.equal(failure["phase"], "terraform.validate");
+});
+
+test("adapter error diagnostic becomes the single canonical deploy failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-adapter-failure-deploy-"));
+  const project = join(directory, "project");
+  await mkdir(project, { recursive: true });
+  await writeFile(join(project, "main.tf"), `output "ready" { value = true }\n`);
+  const adapter = join(project, "failing-adapter.sh");
+  await writeFile(adapter, [
+    "#!/bin/sh",
+    "request=$(cat)",
+    "case \"$request\" in",
+    "  *'\"runtime_project_id\":\"adapter-failure-runtime\"'*) code=ADAPTER_AUTH_EXPIRED ;;",
+    "  *) code=ADAPTER_RUNTIME_ID_MISMATCH ;;",
+    "esac",
+    "printf '{\"schema_version\":2,\"adapter\":\"failing\",\"capabilities\":[],\"bindings\":[],\"diagnostics\":[{\"code\":\"%s\",\"level\":\"error\",\"message\":\"adapter credentials expired\",\"remediation\":\"Refresh adapter credentials.\",\"retryable\":false}]}\\n' \"$code\"",
+    "",
+  ].join("\n"));
+  await chmod(adapter, 0o755);
+  const manifest = minimalManifest();
+  manifest.adapters = { failing: { executable: "./failing-adapter.sh", protocol: 2 } };
+  const output: string[] = [];
+
+  await assert.rejects(runDeploy({
+    root: project,
+    runtimeProjectId: "adapter-failure-runtime",
+    manifestPath: join(project, ".anbo", "sandbox.json"),
+    manifest,
+    action: "deploy",
+    args: [],
+    flags: { "no-test": true },
+    env: {},
+    stateHome: join(directory, "state"),
+    cacheHome: join(directory, "cache"),
+    commands: new IncrementalDeployExecutor(),
+    fetch: async () => Response.json({ edition: "full" }),
+  }, eventSink(output)), (error: unknown) => {
+    assert.ok(error instanceof AnboError);
+    assert.equal(error.code, "ADAPTER_AUTH_EXPIRED");
+    assert.equal(error.message, "adapter credentials expired");
+    assert.equal(error.details?.phase, "adapter.handshake");
+    assert.equal(error.details?.remediation, "Refresh adapter credentials.");
+    return true;
+  });
+
+  const emitted = output.map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(emitted.some((event) => event["kind"] === "diagnostic" &&
+    (event["fields"] as Record<string, unknown> | undefined)?.["code"] === "ADAPTER_AUTH_EXPIRED"), false);
 });
 
 test("deploy skips unchanged Terraform roots and reconciles only invalidated roots", async () => {
@@ -1381,6 +1854,20 @@ test("deploy skips unchanged Terraform roots and reconciles only invalidated roo
     const fields = event["fields"] as Record<string, unknown>;
     assert.equal(typeof fields["duration_ms"], "number");
     assert.equal("fingerprint" in fields, false);
+  }
+  for (const stateKey of [firstStateKey, secondStateKey]) {
+    const hashCache = join(
+      cacheHome,
+      "anbo",
+      "v2",
+      "terraform",
+      "fingerprints",
+      "incremental-runtime",
+      stateKey,
+      "tree-v1.json",
+    );
+    assert.equal(JSON.parse(await readFile(hashCache, "utf8")).schema_version, 1);
+    assert.equal((await stat(hashCache)).mode & 0o777, 0o600);
   }
 
   const coldOutputs = cold["endpoints"] as Record<string, unknown>;
@@ -1700,6 +2187,131 @@ test("capabilities runs through the target runtime", async () => {
   }, eventSink());
   assert.equal(result.status, "succeeded");
   assert.equal((result["capabilities"] as Record<string, unknown>)["schema_version"], 1);
+});
+
+test("debug inspects stopped project containers before a deploy reaches ready state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-failed-debug-test-"));
+  const stateHome = join(directory, "state");
+  const projectId = "failed-debug-runtime";
+  const manifest = minimalManifest();
+  const supervisor = new ProjectSupervisor({
+    projectRoot: directory,
+    projectId,
+    logicalProjectId: manifest.project.name,
+    projectName: manifest.project.name,
+    stateHome,
+  });
+  await supervisor.writeState({
+    status: "failed",
+    last_run_id: "run-failed",
+    last_failure: {
+      code: "ANBO_MINISTACK_RUNTIME",
+      message: "runtime stopped during startup",
+      remediation: "Inspect the stopped container.",
+      phase: "ministack",
+    },
+  });
+  const sessionToken = "opaque-session-value-not-matched-by-default-patterns";
+  const siblingApiKey = "opaque-api-key-from-slower-sibling";
+  const executor = new RecordingExecutor(async (_command, args, options) => {
+    if (args[0] === "ps") return { code: 0, stdout: "dead-container\nsecret-container\n", stderr: "" };
+    if (args[0] === "inspect") return {
+      code: 0,
+      stdout: JSON.stringify([args[1] === "secret-container" ? {
+        Id: "secret-container",
+        Name: `anbo-${projectId}-worker`,
+        Config: {
+          Image: "worker:test",
+          Env: [`API_KEY=${siblingApiKey}`],
+          Labels: { "anbo.dev/component": "service", "anbo.dev/project": projectId },
+        },
+        State: { Running: false, Status: "exited", ExitCode: 1 },
+      } : {
+        Id: "dead-container",
+        Name: `anbo-${projectId}-ministack`,
+        Config: {
+          Image: "ministack:test",
+          Env: [`AWS_SESSION_TOKEN=${sessionToken}`],
+          Labels: { "anbo.dev/component": "ministack", "anbo.dev/project": projectId },
+        },
+        State: { Running: false, Status: "exited", ExitCode: 1, Error: `startup failed with ${siblingApiKey}` },
+      }]),
+      stderr: "",
+    };
+    if (args[0] === "logs" && (args.at(-1) === "dead-container" || args.at(-1)?.endsWith("-ministack") === true)) {
+      await options?.onOutput?.("stdout", `failed with ${sessionToken} and ${siblingApiKey}\n`);
+      return { code: 0, stdout: `failed with ${sessionToken} and ${siblingApiKey}\n`, stderr: "" };
+    }
+    if (args[0] === "logs") {
+      await options?.onOutput?.("stdout", "worker stopped\n");
+      return { code: 0, stdout: "worker stopped\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  const result = await runDeploy({
+    root: directory,
+    runtimeProjectId: projectId,
+    manifestPath: join(directory, ".anbo", "sandbox.json"),
+    manifest,
+    action: "debug",
+    args: [],
+    flags: {},
+    env: {},
+    stateHome,
+    cacheHome: join(directory, "cache"),
+    commands: executor,
+  }, eventSink());
+
+  const serialized = JSON.stringify(result);
+  assert.equal(result["runtime_status"], "failed");
+  assert.match(serialized, /dead-container/);
+  assert.match(serialized, /\[REDACTED\]/);
+  assert.doesNotMatch(serialized, new RegExp(sessionToken));
+  assert.doesNotMatch(serialized, new RegExp(siblingApiKey));
+
+  const logOutput: string[] = [];
+  await runDeploy({
+    root: directory,
+    runtimeProjectId: projectId,
+    manifestPath: join(directory, ".anbo", "sandbox.json"),
+    manifest,
+    action: "logs",
+    args: [],
+    flags: {},
+    env: {},
+    stateHome,
+    cacheHome: join(directory, "cache"),
+    commands: executor,
+  }, eventSink(logOutput));
+  const serializedLogs = logOutput.join("");
+  assert.match(serializedLogs, /\[REDACTED\]/);
+  assert.doesNotMatch(serializedLogs, new RegExp(sessionToken));
+  assert.doesNotMatch(serializedLogs, new RegExp(siblingApiKey));
+
+  const callsBeforeUnknownRun = executor.calls.length;
+  await assert.rejects(runDeploy({
+    root: directory,
+    runtimeProjectId: projectId,
+    manifestPath: join(directory, ".anbo", "sandbox.json"),
+    manifest,
+    action: "debug",
+    args: ["run-does-not-exist"],
+    flags: {},
+    env: {},
+    stateHome,
+    cacheHome: join(directory, "cache"),
+    commands: executor,
+  }, eventSink()), (error: unknown) => {
+    assert.ok(error instanceof AnboError);
+    assert.equal(error.code, "ANBO_DEBUG_RUN_NOT_FOUND");
+    assert.equal(error.exitCode, ExitCode.Configuration);
+    return true;
+  });
+  assert.equal(executor.calls.length, callsBeforeUnknownRun, "an unknown run ID must not collect current container evidence");
+  const stateAfterUnknownRun = (await supervisor.readState()) as Record<string, unknown> | undefined;
+  assert.equal(stateAfterUnknownRun?.["last_run_id"], "run-failed");
+  assert.equal((stateAfterUnknownRun?.["last_failure"] as Record<string, unknown>)["code"], "ANBO_MINISTACK_RUNTIME");
 });
 
 function minimalManifest(): SandboxManifest {
