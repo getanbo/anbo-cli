@@ -14,6 +14,7 @@ import {
   writeManifest,
 } from "../src/config.js";
 import { discoverProject, discoverSdks, discoverTerraform } from "../src/discovery.js";
+import { CERTIFIED_MINISTACK_IMAGE } from "../src/distribution.js";
 import { routeTerraformVariableFiles } from "../src/terraform-layout.js";
 import { AnboError, type DiscoveryReport, type SandboxManifest } from "../src/types.js";
 
@@ -58,7 +59,7 @@ test("manifest v2 accepts cloud and externally supplied clones without literal s
   assert.equal(parseManifest(manifest), manifest);
   assert.equal(
     manifest.ministack.image,
-    "ministackorg/ministack@sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9",
+    CERTIFIED_MINISTACK_IMAGE,
   );
   assert.deepEqual(manifest.builds["lambda-zip"]?.outputs, ["dist/lambda.zip"]);
 });

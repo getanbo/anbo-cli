@@ -1,15 +1,14 @@
 # MiniStack Support
 
-The MiniStack plugin certifies the official full multi-platform image at
-`ministackorg/ministack@sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9`.
-It was built from upstream MiniStack v1.4.2 commit
-`25c2cbad8ff77108823359d3d5c8e92a44726acd` and qualified through the installed
-canonical CLI acceptance suite on both published platforms. See
-`runtime-manifest.json` for the machine-readable provenance.
+The MiniStack plugin certifies the full multi-platform Anbo MiniStack image
+recorded in `runtime-manifest.json`. That manifest binds the immutable GHCR
+digest to both the Anbo distribution commit and its exact upstream MiniStack
+release and commit. The image is qualified through the packed canonical CLI
+acceptance suite before release.
 Benchmark controls that use MiniStack's default light image share this upstream
 commit and release, but not the image digest: Anbo deliberately certifies the
-official full edition because the plugin's product contract requires its
-full-image components.
+full Anbo distribution because the plugin's product contract requires its
+full-image components and per-instance Docker ownership contract.
 The matrix contains 71 service surfaces. It describes expected fidelity and is
 not a Terraform allowlist; use `anbo capabilities --json` for the exact current
 entries, requirements, endpoint names, and per-service limitations.

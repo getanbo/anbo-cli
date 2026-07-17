@@ -3,14 +3,8 @@ name: Promote MiniStack runtime pin
 on:
   workflow_dispatch:
     inputs:
-      digest:
-        description: Candidate multi-platform index digest (sha256:...)
-        required: true
-      upstream_sha:
-        description: Exact upstream MiniStack commit
-        required: true
-      upstream_version:
-        description: Exact upstream MiniStack release version
+      release_tag:
+        description: Published getanbo/anbo-ministack release tag
         required: true
 
 permissions:
@@ -27,20 +21,25 @@ jobs:
           node-version: 22
       - name: Update structured runtime manifests
         env:
-          ANBO_MINISTACK_DIGEST: ${{ inputs.digest }}
-          ANBO_MINISTACK_UPSTREAM_SHA: ${{ inputs.upstream_sha }}
-          ANBO_MINISTACK_VERSION: ${{ inputs.upstream_version }}
-          ANBO_MINISTACK_PLATFORMS: linux/amd64,linux/arm64
-        run: node plugins/ministack/scripts/update-runtime-pin.mjs
+          ANBO_MINISTACK_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          release_manifest="$(mktemp)"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/getanbo/anbo-ministack/releases/download/${ANBO_MINISTACK_RELEASE_TAG}/release-manifest.json" \
+            --output "$release_manifest"
+          ANBO_MINISTACK_RELEASE_MANIFEST="$release_manifest" \
+            node plugins/ministack/scripts/update-runtime-pin.mjs
       - name: Open digest bump pull request
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          branch="sync/ministack-${{ inputs.upstream_sha }}"
+          branch="sync/ministack-${{ inputs.release_tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add plugins/ministack/runtime-manifest.json plugins/ministack/fixtures/terraform-smoke/.anbo/sandbox.json
-          git commit -m "chore: promote MiniStack runtime digest"
+          git add \
+            plugins/ministack/runtime-manifest.json \
+            plugins/ministack/fixtures/terraform-smoke/.anbo/sandbox.json
+          git commit -m "chore: promote Anbo MiniStack runtime"
           git push --set-upstream origin "$branch"
-          gh pr create --title "chore: promote MiniStack runtime digest" --body "Pins the exact upstream source and multi-platform index digest. Merge is gated on installed-CLI acceptance." --base main --head "$branch"
+          gh pr create --title "chore: promote Anbo MiniStack runtime" --body "Pins the verified Anbo MiniStack release manifest, including upstream provenance, full-image digest, and instance-isolation contract. Merge is gated on installed-CLI acceptance." --base main --head "$branch"
