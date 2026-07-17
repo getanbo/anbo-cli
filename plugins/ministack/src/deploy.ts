@@ -37,6 +37,7 @@ import {
   type CloneLease,
 } from "./runtime/clones.js";
 import {
+  miniStackInstanceIsolationFromHealth,
   ProcessCommandExecutor,
   pruneMiniStackCertification,
   safeProjectId,
@@ -46,7 +47,6 @@ import {
   type MiniStackRuntime,
 } from "./runtime/ministack.js";
 import {
-  ensureApplicationNetwork,
   refreshRuntimeBoundServices,
   resolveServiceEnvironment,
   runConfiguredTests,
@@ -126,6 +126,12 @@ interface PersistedRuntimeState extends SupervisorState {
       fingerprint: string;
       certification: string;
       certification_cache_hit: boolean;
+    };
+    instance_isolation?: {
+      contract_version: 1;
+      instance_id: string;
+      scope: string;
+      docker_network: string;
     };
   };
   terraform?: {
@@ -522,11 +528,10 @@ async function deploySandbox(
 
   reportPhase("service");
   const servicesPhase = await sink.startPhase("application services", "docker");
-  const appNetwork = await ensureApplicationNetwork(projectId, miniStack.containerName, request.commands ?? defaultCommands);
   const serviceContext: ServiceRuntimeContext = {
     runId: sink.runId,
     projectId,
-    networkName: appNetwork,
+    networkName: miniStack.runtimeNetworkName,
     miniStackEndpoint: miniStack.containerEndpoint,
     terraformOutputs: terraform.outputs,
     clones,
@@ -870,6 +875,13 @@ async function persistedDeploymentAlive(
     if (!health.ok) return false;
     const healthBody = await health.json() as unknown;
     if (!isRecord(healthBody) || healthBody["edition"] !== "full") return false;
+    const isolation = miniStack.instance_isolation;
+    if (isolation === undefined) return false;
+    miniStackInstanceIsolationFromHealth(
+      healthBody,
+      isolation.instance_id,
+      isolation.docker_network,
+    );
     const context = runtimeContextFromState(request, state, {}, {}, signal, runId);
     return await validateDeclaredServices(
       request.manifest.services,
@@ -1569,8 +1581,10 @@ async function testExistingSandbox(
   if (refreshableServices.length > 0) {
     reportPhase("service");
     const servicePhase = await sink.startPhase("refresh runtime-bound services", "docker");
-    const appNetwork = await ensureApplicationNetwork(state.project_id, miniStack.container_name, request.commands ?? defaultCommands);
-    context = { ...context, networkName: appNetwork };
+    context = {
+      ...context,
+      networkName: miniStack.runtime_network_name ?? `anbo-${state.project_id}-runtime`,
+    };
     const refreshed = await refreshRuntimeBoundServices(request.manifest.services, context, services, {
       commands: request.commands ?? defaultCommands,
       ...(request.fetch === undefined ? {} : { fetch: request.fetch }),
@@ -2383,6 +2397,7 @@ async function debugRun(
     true,
     (value) => sink.redactor.redactString(value),
     (value) => sink.redactor.registerSecret(value),
+    true,
   );
   const resources = await inspectProjectDockerResources(
     supervisor.projectId,
@@ -2433,15 +2448,28 @@ async function inspectProjectContainers(
   includeLogs: boolean,
   redact: (value: string) => string = (value) => value,
   registerSecret: (value: string) => void = () => undefined,
+  includeMiniStackChildren = false,
 ): Promise<ProjectContainerEvidence[]> {
-  const listed = await commands.run("docker", [
-    "ps", "-aq", "--filter", `label=anbo.dev/project=${projectId}`,
-  ], { signal });
-  if (listed.code !== 0) {
+  const filters = [
+    [`label=anbo.dev/project=${projectId}`],
+    ...(includeMiniStackChildren
+      ? [[
+          "label=com.ministack.managed=true",
+          `label=com.ministack.instance=${projectId}`,
+        ]]
+      : []),
+  ];
+  const listings = await Promise.all(filters.map(async (filter) => await commands.run("docker", [
+    "ps", "-aq", ...filter.flatMap((value) => ["--filter", value]),
+  ], { signal })));
+  for (const listed of listings) {
+    if (listed.code === 0) continue;
     const detail = listed.stderr.trim() || listed.stdout.trim() || `exit code ${listed.code}`;
     throw new Error(`could not inspect project containers: ${redact(detail)}`);
   }
-  const ids = listed.stdout.split(/\s+/).filter(Boolean);
+  const ids = [...new Set(
+    listings.flatMap((listed) => listed.stdout.split(/\s+/).filter(Boolean)),
+  )];
   const inspectedContainers = await Promise.all(ids.map(async (id): Promise<{
     id: string;
     evidence: ProjectContainerEvidence;
@@ -2463,13 +2491,23 @@ async function inspectProjectContainers(
     const state = isRecord(record["State"]) ? record["State"] : {};
     const health = isRecord(state["Health"]) ? state["Health"] : {};
     const rawName = typeof record["Name"] === "string" ? record["Name"].replace(/^\//, "") : id;
+    const miniStackService = typeof labels["com.ministack.service"] === "string"
+      ? labels["com.ministack.service"]
+      : undefined;
+    const isMiniStackChild = labels["com.ministack.managed"] === "true"
+      && labels["com.ministack.instance"] === projectId
+      && miniStackService !== undefined;
     const component = typeof labels["anbo.dev/component"] === "string"
       ? labels["anbo.dev/component"]
-      : "container";
+      : isMiniStackChild
+        ? "ministack-child"
+        : "container";
     const prefix = `anbo-${projectId}-`;
-    const service = component === "service" && rawName.startsWith(prefix)
-      ? rawName.slice(prefix.length)
-      : component;
+    const service = isMiniStackChild
+      ? miniStackService
+      : component === "service" && rawName.startsWith(prefix)
+        ? rawName.slice(prefix.length)
+        : component;
     return {
       id,
       evidence: {
@@ -2549,7 +2587,7 @@ function runtimeContextFromState(
   return {
     runId,
     projectId: state.project_id,
-    networkName: `anbo-${state.project_id}-app`,
+    networkName: miniStack.runtime_network_name ?? `anbo-${state.project_id}-runtime`,
     miniStackEndpoint: miniStack.container_endpoint,
     terraformOutputs: state.terraform?.outputs ?? {},
     clones,
@@ -2647,6 +2685,12 @@ function persistedMiniStack(runtime: MiniStackRuntime): NonNullable<PersistedRun
     host_endpoint: runtime.hostEndpoint,
     container_endpoint: runtime.containerEndpoint,
     image: runtime.image,
+    instance_isolation: {
+      contract_version: runtime.instanceIsolation.contractVersion,
+      instance_id: runtime.instanceIsolation.instanceId,
+      scope: runtime.instanceIsolation.scope,
+      docker_network: runtime.instanceIsolation.dockerNetwork,
+    },
     ...(runtime.compatibility === undefined ? {} : {
       compatibility: {
         id: runtime.compatibility.id,

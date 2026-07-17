@@ -205,11 +205,13 @@ rejects production AWS credentials, provisioners, external data sources,
 remote-state data sources, host Terraform fallback, and local modules that
 escape the configured root. See [MiniStack support](docs/ministack-support.md).
 
-The pinned upstream MiniStack 1.4.2 runtime removes Docker-backed child
-resources by global `ministack=*` labels during startup and shutdown. Until
-upstream child labels are project-namespaced, do not run multiple Docker-backed
-MiniStack runtimes concurrently on the same Docker daemon. Anbo's own service,
-network, Terraform worker, and build-image labels remain checkout-isolated.
+Each checkout receives a root-derived runtime ID. The certified Anbo MiniStack
+runtime uses that ID to scope child-container names, persistent volumes,
+dynamic host ports, ownership labels, and lifecycle cleanup. Multiple checkouts
+can therefore share one Docker daemon while keeping their MiniStack parents and
+Docker-backed Lambda, RDS, ECS, EKS, ElastiCache, OpenSearch, MWAA, and Glue
+children independent. Startup fails before Terraform runs if an image does not
+expose the required instance-isolation health contract.
 
 ## Extensions
 
@@ -220,11 +222,10 @@ return typed bindings and diagnostics. See [Adapter protocol v2](docs/adapters-v
 ## Runtime Pin
 
 [`runtime-manifest.json`](runtime-manifest.json) is the single audited runtime
-pin. It records the upstream MiniStack commit, exact official multi-platform
-full-image index, every certified image platform, and the ARM64 compatibility
-recipe. The configured runtime is always the immutable
-`ministackorg/ministack@sha256:...` reference; mutable tags are never accepted
-as the release pin.
+pin. It records the Anbo MiniStack release and commit, its exact upstream
+MiniStack provenance, the immutable full-image index, every certified platform,
+the instance-isolation contract, and the ARM64 compatibility recipe. Mutable
+tags are never accepted as the release pin.
 
 ## Development
 

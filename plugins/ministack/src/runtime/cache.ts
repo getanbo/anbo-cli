@@ -107,6 +107,7 @@ export async function buildDeclaredImages(
   const projectId = safeProjectId(options.projectId);
   const results: Record<string, BuildResult> = {};
   let buildxAvailable: boolean | undefined;
+  let buildxLocalCacheAvailable = true;
   for (const [name, config] of Object.entries(options.builds)) {
     const context = resolve(options.root, config.context);
     const cacheDirectory = join(options.cacheRoot, projectId, safeProjectId(name));
@@ -196,22 +197,43 @@ export async function buildDeclaredImages(
             .flatMap(([key, value]) => ["--build-arg", `${key}=${value}`]),
           preparedContext,
         ];
-        const args = buildxAvailable
+        let args = buildxAvailable
           ? [
               "buildx", "build", "--load",
               ...commonArgs.slice(0, -1),
-              ...(existsSync(buildkitCache) ? ["--cache-from", `type=local,src=${buildkitCache}`] : []),
-              "--cache-to", `type=local,dest=${nextCache},mode=max`,
+              ...(buildxLocalCacheAvailable && existsSync(buildkitCache)
+                ? ["--cache-from", `type=local,src=${buildkitCache}`]
+                : []),
+              ...(buildxLocalCacheAvailable
+                ? ["--cache-to", `type=local,dest=${nextCache},mode=max`]
+                : []),
               "--metadata-file", metadataPath,
               preparedContext,
             ]
           : ["build", ...commonArgs];
         let result: Awaited<ReturnType<CommandExecutor["run"]>>;
         try {
-          result = await commands.run("docker", args, {
+          const commandOptions = {
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(dependencies.onOutput === undefined ? {} : { onOutput: (stream: "stdout" | "stderr", text: string) => dependencies.onOutput?.(name, stream, text) }),
-          });
+          };
+          result = await commands.run("docker", args, commandOptions);
+          if (buildxAvailable && buildxLocalCacheAvailable && unsupportedBuildxLocalCache(result)) {
+            buildxLocalCacheAvailable = false;
+            await rm(nextCache, { recursive: true, force: true });
+            await dependencies.onOutput?.(
+              name,
+              "stderr",
+              "Docker's active Buildx driver cannot export a local cache; retrying with the engine layer cache.\n",
+            );
+            args = [
+              "buildx", "build", "--load",
+              ...commonArgs.slice(0, -1),
+              "--metadata-file", metadataPath,
+              preparedContext,
+            ];
+            result = await commands.run("docker", args, commandOptions);
+          }
         } finally {
           await rm(preparedContext, { recursive: true, force: true });
         }
@@ -219,7 +241,11 @@ export async function buildDeclaredImages(
           const builder = buildxAvailable ? "Buildx" : "classic Docker builder";
           throw new Error(`Docker build ${name} failed with ${builder}: ${result.stderr.trim() || result.stdout.trim()}`);
         }
-        metadata = { ...contextMetadata, build_engine: buildxAvailable ? "buildx" : "docker" };
+        metadata = {
+          ...contextMetadata,
+          build_engine: buildxAvailable ? "buildx" : "docker",
+          build_cache: buildxAvailable && buildxLocalCacheAvailable ? "local" : "engine",
+        };
         if (buildxAvailable) {
           try {
             metadata = {
@@ -266,6 +292,14 @@ async function hasBuildx(commands: CommandExecutor, signal?: AbortSignal): Promi
     return false;
   }
   throw new Error(`could not check Docker Buildx availability: ${detail}`);
+}
+
+function unsupportedBuildxLocalCache(
+  result: { code: number; stdout: string; stderr: string },
+): boolean {
+  if (result.code === 0) return false;
+  const detail = `${result.stderr}\n${result.stdout}`;
+  return /cache export is not supported for the docker driver|local cache exporter is not supported/i.test(detail);
 }
 
 export async function pruneBuildCache(

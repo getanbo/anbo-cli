@@ -35,6 +35,18 @@ class TestExecutor implements CommandExecutor {
   }
 }
 
+function isolatedHealthResponse(projectId: string): Response {
+  return Response.json({
+    edition: "full",
+    instance_isolation: {
+      contract_version: 1,
+      instance_id: projectId,
+      scope: `${projectId}-test-scope`,
+      docker_network: `anbo-${projectId}-runtime`,
+    },
+  });
+}
+
 for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
   test(`certified runtime selects native ${serverPlatform} with exact Docker arguments`, async () => {
     let runArguments: readonly string[] = [];
@@ -67,7 +79,7 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       stateRoot: "/tmp/unused",
     }, {
       commands: executor,
-      fetch: async () => Response.json({ edition: "full" }),
+      fetch: async () => isolatedHealthResponse("platform-selection"),
       onCompatibility: async (metadata) => { compatibilityEvents.push(metadata); },
     });
 
@@ -82,6 +94,7 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       "--label", "anbo.dev/managed=true",
       "--label", "anbo.dev/project=platform-selection",
       "--label", "anbo.dev/component=ministack",
+      "--label", "com.ministack.instance=platform-selection",
       ...(serverPlatform === "linux/arm64" ? ["--label", compatibilityLabel] : []),
       "--label", runtimeConfigLabel,
       "--network", "anbo-platform-selection-runtime",
@@ -95,12 +108,19 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       "--env", `LAMBDA_DOCKER_FLAGS=${managedLambdaFlags()}`,
       "--env", "MINISTACK_REGION=us-east-1",
       "--env", "MINISTACK_ACCOUNT_ID=000000000000",
+      "--env", "MINISTACK_INSTANCE_ID=platform-selection",
       ...(serverPlatform === "linux/arm64" ? ["--env", "OPENSSL_armcap=0"] : []),
       CERTIFIED_MINISTACK_IMAGE,
     ]);
     assert.deepEqual(executor.calls[0]?.args, ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]);
     assert.equal(runtime.platform, serverPlatform);
     assert.equal(runtime.serverPlatform, serverPlatform);
+    assert.deepEqual(runtime.instanceIsolation, {
+      contractVersion: 1,
+      instanceId: "platform-selection",
+      scope: "platform-selection-test-scope",
+      dockerNetwork: "anbo-platform-selection-runtime",
+    });
     if (serverPlatform === "linux/arm64") {
       assert.ok(compatibilityLabel);
       assert.equal(runtime.compatibility?.certificationCacheHit, true);
@@ -188,7 +208,7 @@ test("ARM64 compatibility probes once and reuses only the exact certified image"
   };
   const dependencies = {
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("arm64-certification"),
     onCompatibility: async (metadata: { certificationCacheHit: boolean }) => {
       cacheHits.push(metadata.certificationCacheHit);
     },
@@ -238,7 +258,7 @@ test("ARM64 compatibility certification fails clearly and never records a cache 
     stateRoot: "/tmp/unused",
   }, {
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("arm64-certification-failure"),
   }), /ARM64 compatibility certification failed: Illegal instruction/);
   assert.equal(executor.calls.some((call) => call.args[0] === "image" && call.args[1] === "tag"), false);
 });
@@ -282,7 +302,7 @@ test("ARM64 compatibility preserves probe failure when certification-container c
       stateRoot: "/tmp/unused",
     }, {
       commands: executor,
-      fetch: async () => Response.json({ edition: "full" }),
+      fetch: async () => isolatedHealthResponse("arm64-primary-failure"),
     });
   } catch (error) {
     failure = error;
@@ -413,6 +433,60 @@ test("Docker builds safely fall back when the Buildx plugin is unavailable", asy
     assert.ok(build);
     assert.equal(build.args.includes("--cache-to"), false);
     assert.equal(result.api?.metadata["build_engine"], "docker");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Docker builds retry without local cache export when the active Buildx driver rejects it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-buildx-cache-fallback-"));
+  try {
+    await writeFile(join(directory, "Dockerfile"), "FROM scratch\n");
+    let built = false;
+    const output: string[] = [];
+    const executor = new TestExecutor(async (args) => {
+      if (args[0] === "image") return built
+        ? { code: 0, stdout: "sha256:fallback-image\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "missing" };
+      if (args[0] === "buildx" && args[1] === "version") {
+        return { code: 0, stdout: "github.com/docker/buildx v0.30.1\n", stderr: "" };
+      }
+      if (args[0] === "buildx" && args[1] === "build") {
+        if (args.includes("--cache-to")) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "ERROR: Cache export is not supported for the docker driver.",
+          };
+        }
+        built = true;
+        return { code: 0, stdout: "built with engine cache\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` };
+    });
+
+    const result = await buildDeclaredImages({
+      projectId: "cache-fallback",
+      root: directory,
+      builds: { api: { context: ".", inputs: ["Dockerfile"] } },
+      cacheRoot: join(directory, "cache"),
+    }, {
+      commands: executor,
+      onOutput: (_build, _stream, text) => {
+        output.push(text);
+      },
+    });
+
+    const builds = executor.calls.filter(
+      (call) => call.args[0] === "buildx" && call.args[1] === "build",
+    );
+    assert.equal(builds.length, 2);
+    assert.equal(builds[0]?.args.includes("--cache-to"), true);
+    assert.equal(builds[1]?.args.includes("--cache-to"), false);
+    assert.equal(builds[1]?.args.includes("--cache-from"), false);
+    assert.equal(result.api?.metadata["build_engine"], "buildx");
+    assert.equal(result.api?.metadata["build_cache"], "engine");
+    assert.match(output.join(""), /retrying with the engine layer cache/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

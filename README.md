@@ -124,7 +124,7 @@ The scheduled/dispatchable **Official plugins acceptance** workflow packs every 
 - [`packages`](packages): executable, SDK, event protocol, config, locks, and acceptance kit.
 - [`plugins/ministack`](plugins/ministack): local Terraform and MiniStack target.
 - [`plugins/cloud`](plugins/cloud): remote Anbo Cloud target.
-- [`getanbo/anbo-ministack`](https://github.com/getanbo/anbo-ministack): downstream patch-staging mirror; the plugin runtime remains pinned to an exact official upstream image.
+- [`getanbo/anbo-ministack`](https://github.com/getanbo/anbo-ministack): upstream-tracking runtime distribution with the generic per-instance Docker ownership contract required by the MiniStack plugin.
 - [`getanbo/anbo-k8s`](https://github.com/getanbo/anbo-k8s): hosted backend and infrastructure consumed by the Cloud plugin.
 - [`getanbo/anbo-example-notes`](https://github.com/getanbo/anbo-example-notes): external reference consumer and full product acceptance flow.
 
