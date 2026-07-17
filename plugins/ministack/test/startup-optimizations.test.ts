@@ -35,6 +35,18 @@ class TestExecutor implements CommandExecutor {
   }
 }
 
+function isolatedHealthResponse(projectId: string): Response {
+  return Response.json({
+    edition: "full",
+    instance_isolation: {
+      contract_version: 1,
+      instance_id: projectId,
+      scope: `${projectId}-test-scope`,
+      docker_network: `anbo-${projectId}-runtime`,
+    },
+  });
+}
+
 for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
   test(`certified runtime selects native ${serverPlatform} with exact Docker arguments`, async () => {
     let runArguments: readonly string[] = [];
@@ -67,7 +79,7 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       stateRoot: "/tmp/unused",
     }, {
       commands: executor,
-      fetch: async () => Response.json({ edition: "full" }),
+      fetch: async () => isolatedHealthResponse("platform-selection"),
       onCompatibility: async (metadata) => { compatibilityEvents.push(metadata); },
     });
 
@@ -82,6 +94,7 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       "--label", "anbo.dev/managed=true",
       "--label", "anbo.dev/project=platform-selection",
       "--label", "anbo.dev/component=ministack",
+      "--label", "com.ministack.instance=platform-selection",
       ...(serverPlatform === "linux/arm64" ? ["--label", compatibilityLabel] : []),
       "--label", runtimeConfigLabel,
       "--network", "anbo-platform-selection-runtime",
@@ -95,12 +108,19 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       "--env", `LAMBDA_DOCKER_FLAGS=${managedLambdaFlags()}`,
       "--env", "MINISTACK_REGION=us-east-1",
       "--env", "MINISTACK_ACCOUNT_ID=000000000000",
+      "--env", "MINISTACK_INSTANCE_ID=platform-selection",
       ...(serverPlatform === "linux/arm64" ? ["--env", "OPENSSL_armcap=0"] : []),
       CERTIFIED_MINISTACK_IMAGE,
     ]);
     assert.deepEqual(executor.calls[0]?.args, ["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]);
     assert.equal(runtime.platform, serverPlatform);
     assert.equal(runtime.serverPlatform, serverPlatform);
+    assert.deepEqual(runtime.instanceIsolation, {
+      contractVersion: 1,
+      instanceId: "platform-selection",
+      scope: "platform-selection-test-scope",
+      dockerNetwork: "anbo-platform-selection-runtime",
+    });
     if (serverPlatform === "linux/arm64") {
       assert.ok(compatibilityLabel);
       assert.equal(runtime.compatibility?.certificationCacheHit, true);
@@ -188,7 +208,7 @@ test("ARM64 compatibility probes once and reuses only the exact certified image"
   };
   const dependencies = {
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("arm64-certification"),
     onCompatibility: async (metadata: { certificationCacheHit: boolean }) => {
       cacheHits.push(metadata.certificationCacheHit);
     },
@@ -238,7 +258,7 @@ test("ARM64 compatibility certification fails clearly and never records a cache 
     stateRoot: "/tmp/unused",
   }, {
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("arm64-certification-failure"),
   }), /ARM64 compatibility certification failed: Illegal instruction/);
   assert.equal(executor.calls.some((call) => call.args[0] === "image" && call.args[1] === "tag"), false);
 });
@@ -282,7 +302,7 @@ test("ARM64 compatibility preserves probe failure when certification-container c
       stateRoot: "/tmp/unused",
     }, {
       commands: executor,
-      fetch: async () => Response.json({ edition: "full" }),
+      fetch: async () => isolatedHealthResponse("arm64-primary-failure"),
     });
   } catch (error) {
     failure = error;

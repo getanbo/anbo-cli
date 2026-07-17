@@ -8,6 +8,10 @@ import test from "node:test";
 import type { PluginContextV1 } from "@getanbo/plugin-sdk";
 
 import { classifyRuntimeError, runDeploy } from "../src/deploy.js";
+import {
+  CERTIFIED_MINISTACK_DIGEST,
+  CERTIFIED_MINISTACK_IMAGE,
+} from "../src/distribution.js";
 import { PluginEventSink } from "../src/event-sink.js";
 import { buildDeclaredImages, pruneBuildCache } from "../src/runtime/cache.js";
 import { AmbiguousCloneCreateError, acquireClone, acquireConfiguredClones, readCloneState } from "../src/runtime/clones.js";
@@ -55,11 +59,23 @@ class RecordingExecutor implements CommandExecutor {
   }
 }
 
+function isolatedHealthResponse(projectId: string): Response {
+  return Response.json({
+    edition: "full",
+    instance_isolation: {
+      contract_version: 1,
+      instance_id: projectId,
+      scope: `${projectId}-test-scope`,
+      docker_network: `anbo-${projectId}-runtime`,
+    },
+  });
+}
+
 class IncrementalDeployExecutor implements CommandExecutor {
   readonly calls: Array<{ command: string; args: string[]; options?: RuntimeCommandOptions }> = [];
   readonly terraformCommands: Array<{ command: string; stateKey: string }> = [];
   planCode: 0 | 2 = 2;
-  failApplicationNetwork = false;
+  failDeclaredService = false;
   failTerraformCommand?: string;
   private containerExists = false;
   private containerRunning = true;
@@ -79,17 +95,11 @@ class IncrementalDeployExecutor implements CommandExecutor {
     this.calls.push({ command, args: [...args], ...(options === undefined ? {} : { options }) });
     if (args[0] === "version") return { code: 0, stdout: "linux/amd64\n", stderr: "" };
     if (args[0] === "network" && args[1] === "inspect") {
-      if (this.failApplicationNetwork && args[2]?.endsWith("-app") === true) {
-        return { code: 1, stdout: "", stderr: "missing" };
-      }
       return {
         code: 0,
         stdout: JSON.stringify([{ Internal: args[2]?.endsWith("-control") === true }]),
         stderr: "",
       };
-    }
-    if (this.failApplicationNetwork && args[0] === "network" && args[1] === "create" && args.at(-1)?.endsWith("-app") === true) {
-      return { code: 1, stdout: "", stderr: "injected application network failure" };
     }
     if (args[0] === "network" && args[1] === "connect" && args[3]?.endsWith("-ministack") === true) {
       if (args[2]?.endsWith("-control") === true) this.controlNetwork = args[2];
@@ -106,6 +116,9 @@ class IncrementalDeployExecutor implements CommandExecutor {
       assert.ok(stateMount);
       this.terraformStateDirectory = stateMount.slice("type=bind,src=".length, -",dst=/anbo-state".length);
       return { code: 0, stdout: "terraform-worker\n", stderr: "" };
+    }
+    if (this.failDeclaredService && args[0] === "run" && args.includes("anbo.dev/component=service")) {
+      return { code: 1, stdout: "", stderr: "injected declared service failure" };
     }
     if (args[0] === "exec" && args.includes("terraform")) return await this.runTerraform(args);
     if (args[0] === "run" && args.includes("--rm")) return await this.runTerraform(args);
@@ -219,15 +232,19 @@ function eventSink(output: string[] = []): PluginEventSink {
 
 test("MiniStack accepts only digest-pinned full images", () => {
   const digest = `sha256:${"a".repeat(64)}`;
-  const certifiedDigest = "sha256:636c4ef52bff20e29f161d24e895359b2927f72a143d726792faa86160043ca9";
-  const certifiedImage = `ministackorg/ministack@${certifiedDigest}`;
-  assert.equal(resolveMiniStackImage(certifiedImage, certifiedDigest), certifiedImage);
+  assert.equal(
+    resolveMiniStackImage(CERTIFIED_MINISTACK_IMAGE, CERTIFIED_MINISTACK_DIGEST),
+    CERTIFIED_MINISTACK_IMAGE,
+  );
   assert.equal(
     resolveMiniStackImage("ministackorg/ministack:1.4.2-full", digest),
     `ministackorg/ministack:1.4.2-full@${digest}`,
   );
   assert.equal(resolveMiniStackImage(`ministackorg/ministack:full@${digest}`), `ministackorg/ministack:full@${digest}`);
-  assert.throws(() => resolveMiniStackImage(certifiedImage, `sha256:${"b".repeat(64)}`), /does not match/);
+  assert.throws(
+    () => resolveMiniStackImage(CERTIFIED_MINISTACK_IMAGE, `sha256:${"b".repeat(64)}`),
+    /does not match/,
+  );
   assert.throws(() => resolveMiniStackImage("ministackorg/ministack:1.4.2"), /pinned/);
   assert.throws(() => resolveMiniStackImage("ministackorg/ministack:1.4.2", digest), /full tag/);
 });
@@ -250,7 +267,7 @@ test("MiniStack separates the egress runtime network from the internal Terraform
     stateRoot: "/tmp/unused",
   }, {
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("checkout"),
   });
 
   const creates = executor.calls.filter((call) => call.args[0] === "network" && call.args[1] === "create");
@@ -271,7 +288,74 @@ test("MiniStack separates the egress runtime network from the internal Terraform
   assert.equal(runtime.networkName, "anbo-checkout-control");
   assert.equal(runtime.runtimeNetworkName, "anbo-checkout-runtime");
   assert.equal(runtime.lambdaEndpoint, "http://ministack:4566");
+  assert.deepEqual(runtime.instanceIsolation, {
+    contractVersion: 1,
+    instanceId: "checkout",
+    scope: "checkout-test-scope",
+    dockerNetwork: "anbo-checkout-runtime",
+  });
 });
+
+for (const scenario of [
+  {
+    name: "missing",
+    health: { edition: "full" },
+    expected: /does not expose the required instance-isolation contract/,
+  },
+  {
+    name: "wrong instance",
+    health: {
+      edition: "full",
+      instance_isolation: {
+        contract_version: 1,
+        instance_id: "another-sandbox",
+        scope: "another-sandbox-test-scope",
+        docker_network: "anbo-checkout-runtime",
+      },
+    },
+    expected: /reported instance another-sandbox, expected checkout/,
+  },
+  {
+    name: "wrong network",
+    health: {
+      edition: "full",
+      instance_isolation: {
+        contract_version: 1,
+        instance_id: "checkout",
+        scope: "checkout-test-scope",
+        docker_network: "anbo-another-sandbox-runtime",
+      },
+    },
+    expected: /reported Docker network anbo-another-sandbox-runtime, expected anbo-checkout-runtime/,
+  },
+] as const) {
+  test(`MiniStack rejects a ${scenario.name} isolation contract before deployment`, async () => {
+    let created = false;
+    const executor = new RecordingExecutor(async (_command, args) => {
+      if (args[0] === "network" && args[1] === "inspect") {
+        return { code: 1, stdout: "", stderr: "missing" };
+      }
+      if (args[0] === "inspect") {
+        return created
+          ? { code: 0, stdout: basicMiniStackInspection("container-id", "generation-1", "4566"), stderr: "" }
+          : { code: 1, stdout: "", stderr: "missing" };
+      }
+      if (args[0] === "run") created = true;
+      return { code: 0, stdout: "container-id\n", stderr: "" };
+    });
+
+    await assert.rejects(startMiniStack({
+      projectId: "checkout",
+      image: "ministackorg/ministack:1.4.2-full",
+      digest: `sha256:${"a".repeat(64)}`,
+      persistence: false,
+      stateRoot: "/tmp/unused",
+    }, {
+      commands: executor,
+      fetch: async () => Response.json(scenario.health),
+    }), scenario.expected);
+  });
+}
 
 test("MiniStack reuses only an exact deterministic create-time configuration", async () => {
   const digest = `sha256:${"a".repeat(64)}`;
@@ -294,7 +378,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
   });
   await startMiniStack(baseConfig, {
     commands: missingExecutor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("checkout-reuse"),
   });
 
   const initialRun = missingExecutor.calls.find((call) => call.args[0] === "run");
@@ -354,7 +438,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
     environment: { OPENSEARCH_DATAPLANE: "0", Z_FLAG: "last" },
   }, {
     commands: reorderedExecutor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("checkout-reuse"),
   });
   assert.equal(reorderedExecutor.calls.some((call) => call.args[0] === "rm"), false);
   assert.equal(reorderedExecutor.calls.some((call) => call.args[0] === "run"), false);
@@ -368,7 +452,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
     environment: { OPENSEARCH_DATAPLANE: "1", Z_FLAG: "last" },
   }, {
     commands: environmentChangeExecutor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("checkout-reuse"),
   });
   assert.equal(environmentChangeExecutor.calls.some((call) => call.args[0] === "rm"), true);
   const environmentChangeRun = environmentChangeExecutor.calls.find((call) => call.args[0] === "run");
@@ -381,7 +465,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
   const persistenceChangeExecutor = existingExecutor(true);
   await startMiniStack({ ...baseConfig, persistence: true }, {
     commands: persistenceChangeExecutor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("checkout-reuse"),
   });
   assert.equal(persistenceChangeExecutor.calls.some((call) => call.args[0] === "rm"), true);
   const persistenceChangeRun = persistenceChangeExecutor.calls.find((call) => call.args[0] === "run");
@@ -409,7 +493,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
   });
   const restartedRuntime = await startMiniStack(baseConfig, {
     commands: stoppedExecutor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("checkout-reuse"),
   });
   assert.equal(restartedRuntime.reused, false);
   assert.equal(restartedRuntime.runtimeGeneration, "generation-2");
@@ -428,7 +512,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
     commands: raceExecutor,
     fetch: async () => {
       restartedDuringHealth = true;
-      return Response.json({ edition: "full" });
+      return isolatedHealthResponse("checkout-reuse");
     },
   });
   assert.equal(racedRuntime.reused, false);
@@ -1020,7 +1104,8 @@ test("standalone test refreshes clone credentials for Lambda overlays and smoke 
   assert.match(dockerArgs, new RegExp(`ANBO_DYNAMODB_CLONE_SECRET_ACCESS_KEY=${dynamodbSecretKey}`));
   assert.doesNotMatch(dockerArgs, new RegExp(`rm\\t-f\\tanbo-${escapedRuntimeProjectId}-static`));
   assert.doesNotMatch(dockerArgs, /run[^\n]+\tstatic:(?:manifest|deployed)/);
-  assert.match(dockerArgs, new RegExp(`network\\tconnect\\tanbo-${escapedRuntimeProjectId}-app\\tanbo-${escapedRuntimeProjectId}-ministack`));
+  assert.match(dockerArgs, new RegExp(`--network\\tanbo-${escapedRuntimeProjectId}-runtime`));
+  assert.doesNotMatch(dockerArgs, new RegExp(`anbo-${escapedRuntimeProjectId}-app`));
   assert.deepEqual(result["refreshed_services"], ["rotating"]);
   assert.deepEqual(result["adapters"], {
     rotating: {
@@ -1730,7 +1815,7 @@ test("deploy preserves the exact production Terraform failure phase in state and
     stateHome,
     cacheHome: join(directory, "cache"),
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("terraform-phase-runtime"),
   }, eventSink()), (error: unknown) => {
     assert.ok(error instanceof AnboError);
     assert.equal(error.code, "ANBO_TERRAFORM_VALIDATE_FAILED");
@@ -1783,7 +1868,7 @@ test("adapter error diagnostic becomes the single canonical deploy failure", asy
     stateHome: join(directory, "state"),
     cacheHome: join(directory, "cache"),
     commands: new IncrementalDeployExecutor(),
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("adapter-failure-runtime"),
   }, eventSink(output)), (error: unknown) => {
     assert.ok(error instanceof AnboError);
     assert.equal(error.code, "ADAPTER_AUTH_EXPIRED");
@@ -1831,7 +1916,7 @@ test("deploy skips unchanged Terraform roots and reconciles only invalidated roo
     stateHome,
     cacheHome,
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("incremental-runtime"),
   }, eventSink(events));
   const deploy = async (flags: Record<string, boolean> = {}, events: string[] = []) =>
     await runAction("deploy", flags, events);
@@ -2017,7 +2102,7 @@ test("legacy index state migrates through its trusted root mapping without root 
     stateHome,
     cacheHome,
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("migration-runtime"),
   }, eventSink());
 
   await deploy();
@@ -2062,14 +2147,15 @@ test("legacy index state migrates through its trusted root mapping without root 
   await mkdir(join(project, "infra-c"));
   await writeFile(join(project, "infra-c", "main.tf"), `output "root" { value = "c" }\n`);
   manifest.terraform.roots = ["infra-a", "infra-b", "infra-c"];
+  manifest.services = { api: { image: "api:test" } };
   executor.planCode = 2;
-  executor.failApplicationNetwork = true;
-  await assert.rejects(deploy(), /injected application network failure/);
+  executor.failDeclaredService = true;
+  await assert.rejects(deploy(), /injected declared service failure/);
   assert.deepEqual(
     ((await supervisor.readState())?.["terraform"] as Record<string, unknown>)["pending_roots"],
     ["infra-c"],
   );
-  executor.failApplicationNetwork = false;
+  executor.failDeclaredService = false;
   manifest.terraform.roots = ["infra-a", "infra-b"];
   const failedAdditionRemovalStart = executor.terraformCommands.length;
   await assert.rejects(deploy(), /previously managed root "infra-c".*down --purge/s);
@@ -2113,7 +2199,7 @@ test("legacy migration rejects numeric index aliases before moving any state", a
     stateHome,
     cacheHome: join(directory, "cache"),
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("alias-runtime"),
   }, eventSink()), /legacy root index "00" is not canonical/);
   assert.equal(executor.terraformCommands.length, 0);
   assert.ok((await stat(join(supervisor.stateDirectory, "terraform", "0"))).isDirectory());
@@ -2152,7 +2238,7 @@ test("ambiguous legacy Terraform state fails closed with purge remediation", asy
     stateHome,
     cacheHome: join(directory, "cache"),
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("ambiguous-runtime"),
   }, eventSink()), /Run anbo down --purge, then anbo deploy/);
   assert.equal(executor.terraformCommands.length, 0);
 
@@ -2170,7 +2256,7 @@ test("ambiguous legacy Terraform state fails closed with purge remediation", asy
     stateHome,
     cacheHome: join(directory, "cache"),
     commands: executor,
-    fetch: async () => Response.json({ edition: "full" }),
+    fetch: async () => isolatedHealthResponse("ambiguous-runtime"),
   }, eventSink()), /resolve to the same directory|current Terraform root mapping is ambiguous/);
   assert.equal(executor.terraformCommands.length, 0);
 });
@@ -2314,10 +2400,33 @@ test("debug inspects stopped project containers before a deploy reaches ready st
   const sessionToken = "opaque-session-value-not-matched-by-default-patterns";
   const siblingApiKey = "opaque-api-key-from-slower-sibling";
   const executor = new RecordingExecutor(async (_command, args, options) => {
-    if (args[0] === "ps") return { code: 0, stdout: "dead-container\nsecret-container\n", stderr: "" };
+    if (args[0] === "ps") {
+      return {
+        code: 0,
+        stdout: args.includes(`label=com.ministack.instance=${projectId}`)
+          ? "lambda-child\n"
+          : "dead-container\nsecret-container\n",
+        stderr: "",
+      };
+    }
     if (args[0] === "inspect") return {
       code: 0,
-      stdout: JSON.stringify([args[1] === "secret-container" ? {
+      stdout: JSON.stringify([args[1] === "lambda-child" ? {
+        Id: "lambda-child",
+        Name: "ministack-failed-debug-runtime-scope-lambda-notes",
+        Config: {
+          Image: "public.ecr.aws/lambda/python:3.12",
+          Env: [],
+          Labels: {
+            "ministack": "lambda",
+            "com.ministack.managed": "true",
+            "com.ministack.instance": projectId,
+            "com.ministack.scope": "failed-debug-runtime-scope",
+            "com.ministack.service": "lambda",
+          },
+        },
+        State: { Running: true, Status: "running", ExitCode: 0 },
+      } : args[1] === "secret-container" ? {
         Id: "secret-container",
         Name: `anbo-${projectId}-worker`,
         Config: {
@@ -2366,6 +2475,22 @@ test("debug inspects stopped project containers before a deploy reaches ready st
   const serialized = JSON.stringify(result);
   assert.equal(result["runtime_status"], "failed");
   assert.match(serialized, /dead-container/);
+  assert.match(serialized, /lambda-child/);
+  const evidence = (result["evidence"] as { containers: Array<{ id: string; component: string; service: string }> }).containers;
+  assert.deepEqual(
+    evidence.find((container) => container.id === "lambda-child"),
+    {
+      id: "lambda-child",
+      name: "ministack-failed-debug-runtime-scope-lambda-notes",
+      service: "lambda",
+      component: "ministack-child",
+      image: "public.ecr.aws/lambda/python:3.12",
+      running: true,
+      status: "running",
+      exit_code: 0,
+      logs: "worker stopped\n",
+    },
+  );
   assert.match(serialized, /\[REDACTED\]/);
   assert.doesNotMatch(serialized, new RegExp(sessionToken));
   assert.doesNotMatch(serialized, new RegExp(siblingApiKey));

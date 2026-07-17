@@ -111,7 +111,16 @@ export interface MiniStackRuntime {
   serverPlatform: CertifiedMiniStackPlatform;
   /** Deterministic platform workaround and certification result, when required. */
   compatibility?: MiniStackCompatibilityMetadata;
+  /** MiniStack's scoped Docker ownership contract for this sandbox. */
+  instanceIsolation: MiniStackInstanceIsolationMetadata;
   edition: "full";
+}
+
+export interface MiniStackInstanceIsolationMetadata {
+  contractVersion: 1;
+  instanceId: string;
+  scope: string;
+  dockerNetwork: string;
 }
 
 export interface MiniStackCompatibilityMetadata {
@@ -144,10 +153,12 @@ const MANAGED_RUNTIME_ENVIRONMENT = new Set([
   "LAMBDA_STRICT",
   "LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT",
   "MINISTACK_ACCOUNT_ID",
+  "MINISTACK_INSTANCE_ID",
   "MINISTACK_REGION",
 ]);
 
 class MiniStackCompatibilityCertificationError extends Error {}
+class MiniStackInstanceIsolationError extends Error {}
 
 export function safeProjectId(value: string): string {
   const normalized = value.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -193,6 +204,7 @@ export async function startMiniStack(
   const containerName = `anbo-${projectId}-ministack`;
   const networkName = `anbo-${projectId}-control`;
   const runtimeNetworkName = `anbo-${projectId}-runtime`;
+  const instanceId = projectId;
   const volumeName = config.persistence ? `anbo-${projectId}-ministack-data` : undefined;
   const lambdaEndpoint = `http://${MINISTACK_RUNTIME_ALIAS}:4566`;
   const label = `anbo.dev/project=${projectId}`;
@@ -262,6 +274,7 @@ export async function startMiniStack(
       "run", "--detach", "--name", containerName,
       "--platform", platform,
       "--label", "anbo.dev/managed=true", "--label", label, "--label", "anbo.dev/component=ministack",
+      "--label", `com.ministack.instance=${instanceId}`,
       ...(compatibility === undefined ? [] : ["--label", `${COMPATIBILITY_LABEL}=${compatibility.fingerprint}`]),
       "--label", `${RUNTIME_CONFIG_LABEL}=${runtimeConfigFingerprint}`,
       "--network", runtimeNetworkName,
@@ -275,6 +288,7 @@ export async function startMiniStack(
       "--env", `LAMBDA_DOCKER_FLAGS=${lambdaDockerFlags}`,
       "--env", `MINISTACK_REGION=${config.region ?? "us-east-1"}`,
       "--env", `MINISTACK_ACCOUNT_ID=${config.accountId ?? "000000000000"}`,
+      "--env", `MINISTACK_INSTANCE_ID=${instanceId}`,
       ...environmentArguments(compatibility?.environment),
       ...(config.persistence
         ? [
@@ -315,6 +329,11 @@ export async function startMiniStack(
       const response = await fetcher(`${hostEndpoint}/_ministack/health`, { signal: dependencies.signal });
       const body = await response.json() as Record<string, unknown>;
       if (response.ok && body["edition"] === "full") {
+        const instanceIsolation = miniStackInstanceIsolationFromHealth(
+          body,
+          instanceId,
+          runtimeNetworkName,
+        );
         const healthyInspection = parseDockerInspection((await checked(
           commands,
           "docker",
@@ -383,6 +402,7 @@ export async function startMiniStack(
           platform,
           serverPlatform,
           ...(compatibilityMetadata === undefined ? {} : { compatibility: compatibilityMetadata }),
+          instanceIsolation,
           edition: "full",
         };
       }
@@ -391,7 +411,8 @@ export async function startMiniStack(
         : `health endpoint returned HTTP ${response.status}`;
     } catch (error) {
       rethrowIfAborted(dependencies.signal, error);
-      if (error instanceof MiniStackCompatibilityCertificationError) throw error;
+      if (error instanceof MiniStackCompatibilityCertificationError ||
+          error instanceof MiniStackInstanceIsolationError) throw error;
       lastFailure = error instanceof Error ? error.message : String(error);
     }
     const stopped = await stoppedContainerEvidence(
@@ -406,6 +427,45 @@ export async function startMiniStack(
     await abortableSleep(config.healthIntervalMs ?? 500, sleep, dependencies.signal);
   }
   throw new Error(`MiniStack did not become ready: ${lastFailure}`);
+}
+
+export function miniStackInstanceIsolationFromHealth(
+  health: Readonly<Record<string, unknown>>,
+  expectedInstanceId: string,
+  expectedDockerNetwork: string,
+): MiniStackInstanceIsolationMetadata {
+  const value = health["instance_isolation"];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new MiniStackInstanceIsolationError(
+      "MiniStack image does not expose the required instance-isolation contract",
+    );
+  }
+  const contract = value as Record<string, unknown>;
+  if (contract["contract_version"] !== 1) {
+    throw new MiniStackInstanceIsolationError(
+      `MiniStack instance-isolation contract version ${String(contract["contract_version"] ?? "missing")} is unsupported`,
+    );
+  }
+  if (contract["instance_id"] !== expectedInstanceId) {
+    throw new MiniStackInstanceIsolationError(
+      `MiniStack reported instance ${String(contract["instance_id"] ?? "missing")}, expected ${expectedInstanceId}`,
+    );
+  }
+  if (contract["docker_network"] !== expectedDockerNetwork) {
+    throw new MiniStackInstanceIsolationError(
+      `MiniStack reported Docker network ${String(contract["docker_network"] ?? "missing")}, expected ${expectedDockerNetwork}`,
+    );
+  }
+  const scope = contract["scope"];
+  if (typeof scope !== "string" || scope.length === 0) {
+    throw new MiniStackInstanceIsolationError("MiniStack reported an invalid instance-isolation scope");
+  }
+  return {
+    contractVersion: 1,
+    instanceId: expectedInstanceId,
+    scope,
+    dockerNetwork: expectedDockerNetwork,
+  };
 }
 
 function rethrowIfAborted(signal: AbortSignal | undefined, fallback: unknown): void {
@@ -980,6 +1040,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     LAMBDA_DOCKER_FLAGS: options.lambdaDockerFlags,
     MINISTACK_REGION: options.config.region ?? "us-east-1",
     MINISTACK_ACCOUNT_ID: options.config.accountId ?? "000000000000",
+    MINISTACK_INSTANCE_ID: options.projectId,
     ...(options.compatibility?.environment ?? {}),
     ...(options.config.persistence
       ? {
@@ -1002,7 +1063,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     Object.entries(effectiveEnvironment).sort(([left], [right]) => left.localeCompare(right)),
   );
   const createTimeConfiguration = {
-    version: 3,
+    version: 4,
     project_id: options.projectId,
     image: options.image,
     platform: options.platform,

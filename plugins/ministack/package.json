@@ -64,6 +64,7 @@
     "test:package": "node scripts/verify-package.mjs",
     "test:conformance": "node scripts/run-conformance.mjs",
     "test:installed-cli": "node scripts/run-installed-cli-acceptance.mjs",
+    "test:installed-cli:isolation": "node scripts/run-installed-cli-isolation.mjs",
     "audit": "npm audit --audit-level=high",
     "verify": "npm run audit && npm run typecheck && npm test && npm run test:package && npm run test:conformance",
     "prepack": "npm run clean && npm run build",
