@@ -29,6 +29,7 @@ export interface ServiceRuntimeContext {
 export interface RunningService {
   name: string;
   containerName: string;
+  containerId?: string;
   image: string;
   ports: Record<number, number>;
 }
@@ -45,6 +46,7 @@ interface ReconciledService {
 }
 
 interface ServiceInspection {
+  id?: string;
   running: boolean;
   reusable: boolean;
   fingerprint?: string;
@@ -186,6 +188,36 @@ export function runtimeBoundServiceNames(
     .map(([name]) => name);
 }
 
+export async function validateDeclaredServices(
+  services: Readonly<Record<string, ServiceConfig>>,
+  context: ServiceRuntimeContext,
+  persisted: Readonly<Record<string, RunningService>>,
+  dependencies: {
+    commands?: CommandExecutor;
+    fetch?: typeof globalThis.fetch;
+  } = {},
+): Promise<boolean> {
+  if (!sameStringSet(Object.keys(services), Object.keys(persisted))) return false;
+  const commands = dependencies.commands ?? new ProcessCommandExecutor();
+  const projectId = safeProjectId(context.projectId);
+  for (const [name, config] of Object.entries(services)) {
+    const service = persisted[name];
+    if (service === undefined || service.containerId === undefined ||
+        service.containerName !== `anbo-${projectId}-${safeProjectId(name)}`) return false;
+    const environment = resolveRuntimeEnvironment(name, config, context);
+    const fingerprintEnvironment = Object.fromEntries(
+      Object.entries(environment).filter(([key]) => key !== "ANBO_RUN_ID"),
+    );
+    const imageIdentity = await resolveImageIdentity(service.image, commands);
+    const fingerprint = serviceFingerprint(config, context.networkName, imageIdentity, fingerprintEnvironment);
+    const inspection = await inspectService(service.containerName, commands, projectId);
+    if (inspection?.reusable !== true || inspection.fingerprint !== fingerprint) return false;
+    if (inspection.id !== service.containerId) return false;
+    if (!await probeServiceHealth(service, config, context, commands, dependencies.fetch ?? globalThis.fetch)) return false;
+  }
+  return true;
+}
+
 function serviceHasMutableRuntimeBinding(config: ServiceConfig): boolean {
   if (config.dynamodb_plane === "clone") return true;
   return Object.values(config.environment ?? {}).some((value) =>
@@ -205,6 +237,7 @@ export async function runConfiguredTests(
     onOutput?: (test: string, stream: "stdout" | "stderr", text: string) => void | Promise<void>;
     onTestEvent?: (test: string, event: JsonlV1TestEvent) => void | Promise<void>;
     onProtocolIssue?: (test: string, issue: JsonlV1ProtocolIssue) => void | Promise<void>;
+    onResult?: (test: string, result: { passed: boolean; code: number }) => void | Promise<void>;
   } = {},
 ): Promise<Record<string, { passed: boolean; code: number }>> {
   const commands = dependencies.commands ?? new ProcessCommandExecutor();
@@ -220,9 +253,13 @@ export async function runConfiguredTests(
     if (context.runId !== undefined) environment["ANBO_TEST_RUN_ID"] ??= `${context.runId}:${name}`;
     environment["ANBO_TEST_ID"] = name;
     const decoder = environment["ANBO_TEST_PROTOCOL"] === "jsonl-v1" ? new JsonlV1TestEventDecoder() : undefined;
+    let lastTestEvent: JsonlV1TestEvent | undefined;
     const publishDecoded = async (decoded: JsonlV1DecodeResult | undefined): Promise<void> => {
       if (decoded === undefined) return;
-      for (const event of decoded.events) await dependencies.onTestEvent?.(name, event);
+      for (const event of decoded.events) {
+        lastTestEvent = event;
+        await dependencies.onTestEvent?.(name, event);
+      }
       for (const issue of decoded.issues) await dependencies.onProtocolIssue?.(name, issue);
     };
     const args = [
@@ -258,9 +295,40 @@ export async function runConfiguredTests(
     }
     await publishDecoded(decoder?.finish());
     results[name] = { passed: result.code === 0, code: result.code };
-    if (result.code !== 0) throw new Error(`test ${name} failed with exit code ${result.code}`);
+    await dependencies.onResult?.(name, results[name]!);
+    if (result.code !== 0) {
+      throw new AnboError(`test ${name} failed with exit code ${result.code}`, {
+        exitCode: ExitCode.Test,
+        code: "ANBO_TEST_FAILED",
+        details: {
+          phase: "test",
+          remediation: `Run anbo test ${name} --target ministack after correcting the failing assertion.`,
+          retryable: true,
+          safe_to_retry: true,
+          evidence: {
+            test_id: name,
+            service: test.service,
+            exit_code: result.code,
+            rerun: `anbo test ${name} --target ministack`,
+            ...(lastTestEvent === undefined ? {} : {
+              last_event: lastTestEvent,
+              ...(typeof lastTestEvent.correlation_id === "string"
+                ? { correlation_id: lastTestEvent.correlation_id }
+                : {}),
+            }),
+            stdout_tail: boundedOutputTail(result.stdout),
+            stderr_tail: boundedOutputTail(result.stderr),
+          },
+        },
+      });
+    }
   }
   return results;
+}
+
+function boundedOutputTail(value: string, maxBytes = 8 * 1024): string {
+  const bytes = Buffer.from(value);
+  return bytes.length <= maxBytes ? value.trim() : bytes.subarray(bytes.length - maxBytes).toString("utf8").trim();
 }
 
 export async function stopDeclaredServices(
@@ -287,6 +355,22 @@ export async function stopDeclaredServices(
   assertCleanupResult(disconnected, "disconnect MiniStack from application network", true);
   const removedNetwork = await commands.run("docker", ["network", "rm", network], options);
   assertCleanupResult(removedNetwork, "remove application network", true);
+}
+
+export async function stopDeclaredService(
+  projectIdValue: string,
+  serviceName: string,
+  commands: CommandExecutor = new ProcessCommandExecutor(),
+  signal?: AbortSignal,
+): Promise<void> {
+  const projectId = safeProjectId(projectIdValue);
+  const containerName = `anbo-${projectId}-${safeProjectId(serviceName)}`;
+  const result = await commands.run(
+    "docker",
+    ["rm", "-f", containerName],
+    signal === undefined ? {} : { signal },
+  );
+  assertCleanupResult(result, `remove declared service ${serviceName}`, true);
 }
 
 function assertCleanupResult(
@@ -342,9 +426,9 @@ async function reconcileService(
     Object.entries(environment).filter(([key]) => key !== "ANBO_RUN_ID"),
   );
   const fingerprint = serviceFingerprint(config, context.networkName, imageIdentity, fingerprintEnvironment);
-  const inspection = await inspectService(containerName, commands);
+  const inspection = await inspectService(containerName, commands, projectId);
   if (!forceRestart && inspection?.reusable === true && inspection.fingerprint === fingerprint) {
-    const reused = await runningService(name, containerName, image, config, commands);
+    const reused = await runningService(name, containerName, image, config, commands, inspection.id);
     if (await probeServiceHealth(reused, config, context, commands, fetcher)) {
       return { running: reused, restarted: false, healthVerified: true };
     }
@@ -375,7 +459,12 @@ async function reconcileService(
   const commandOptions = context.signal === undefined ? {} : { signal: context.signal };
   const started = await commands.run("docker", args, commandOptions);
   if (started.code !== 0) throw new Error(`service ${name} failed to start: ${started.stderr.trim()}`);
-  return { running: await runningService(name, containerName, image, config, commands), restarted: true, healthVerified: false };
+  const containerId = started.stdout.trim().split(/\s+/)[0] || undefined;
+  return {
+    running: await runningService(name, containerName, image, config, commands, containerId),
+    restarted: true,
+    healthVerified: false,
+  };
 }
 
 function resolveRuntimeEnvironment(name: string, config: ServiceConfig, context: ServiceRuntimeContext): Record<string, string> {
@@ -404,6 +493,7 @@ async function runningService(
   image: string,
   config: ServiceConfig,
   commands: CommandExecutor,
+  containerId?: string,
 ): Promise<RunningService> {
   const ports: Record<number, number> = {};
   for (const port of config.ports ?? []) {
@@ -411,7 +501,7 @@ async function runningService(
     const match = output.stdout.match(/:(\d+)\s*$/m);
     if (match?.[1] !== undefined) ports[port.container] = Number(match[1]);
   }
-  return { name, containerName, image, ports };
+  return { name, containerName, ...(containerId === undefined ? {} : { containerId }), image, ports };
 }
 
 async function resolveImageIdentity(
@@ -445,7 +535,11 @@ function serviceFingerprint(
   })).digest("hex");
 }
 
-async function inspectService(containerName: string, commands: CommandExecutor): Promise<ServiceInspection | undefined> {
+async function inspectService(
+  containerName: string,
+  commands: CommandExecutor,
+  expectedProjectId: string,
+): Promise<ServiceInspection | undefined> {
   const result = await commands.run("docker", ["inspect", containerName]);
   if (result.code !== 0) {
     const evidence = result.stderr.trim() || result.stdout.trim();
@@ -460,6 +554,7 @@ async function inspectService(containerName: string, commands: CommandExecutor):
     const config = value["Config"];
     const labels = isRecord(config) && isRecord(config["Labels"]) ? config["Labels"] : undefined;
     const fingerprint = labels?.[SERVICE_FINGERPRINT_LABEL];
+    const id = typeof value["Id"] === "string" ? value["Id"] : undefined;
     const running = state?.["Running"] === true;
     const status = typeof state?.["Status"] === "string" ? state["Status"] : undefined;
     const health = isRecord(state?.["Health"]) && typeof state["Health"]["Status"] === "string"
@@ -470,8 +565,12 @@ async function inspectService(containerName: string, commands: CommandExecutor):
       && state?.["Restarting"] !== true
       && state?.["Dead"] !== true
       && (status === undefined || status === "running")
-      && (health === undefined || health === "healthy");
+      && (health === undefined || health === "healthy")
+      && labels?.["anbo.dev/managed"] === "true"
+      && labels?.["anbo.dev/project"] === expectedProjectId
+      && labels?.["anbo.dev/component"] === "service";
     return {
+      ...(id === undefined ? {} : { id }),
       running,
       reusable,
       ...(typeof fingerprint === "string" ? { fingerprint } : {}),
@@ -479,6 +578,10 @@ async function inspectService(containerName: string, commands: CommandExecutor):
   } catch {
     return { running: false, reusable: false };
   }
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value) => right.includes(value));
 }
 
 async function probeServiceHealth(

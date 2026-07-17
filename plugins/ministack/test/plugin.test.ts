@@ -37,6 +37,7 @@ test("exports the complete MiniStack target without owning a CLI binary", () => 
   assert.deepEqual(descriptor.targets, ["ministack"]);
   assert.deepEqual(descriptor.actions, [
     "configure", "deploy", "status", "test", "logs", "debug", "run", "reset", "down", "capabilities", "cache",
+    "impact", "verify", "recover",
   ]);
 });
 

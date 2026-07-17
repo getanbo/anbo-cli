@@ -159,20 +159,49 @@ export function parseManifest(value: unknown): SandboxManifest {
   }
 
   const tests = recordAt(root["tests"], "$.tests", (entry, path) => {
-    const test = objectAt(entry, path, ["command", "service", "environment", "depends_on", "timeout_seconds", "default"]);
+    const test = objectAt(entry, path, [
+      "command",
+      "service",
+      "environment",
+      "depends_on",
+      "inputs",
+      "requires",
+      "tags",
+      "cache",
+      "always_run",
+      "timeout_seconds",
+      "default",
+    ]);
     commandAt(test["command"], `${path}.command`);
-    if (test["service"] !== undefined) {
-      const service = stringAt(test["service"], `${path}.service`);
-      if (!Object.hasOwn(services, service)) fail(`${path}.service`, `references unknown service ${service}`);
-    }
+    const service = stringAt(test["service"], `${path}.service`);
+    if (!Object.hasOwn(services, service)) fail(`${path}.service`, `references unknown service ${service}`);
     if (test["environment"] !== undefined) {
       validateRuntimeEnvironment(stringRecordAt(test["environment"], `${path}.environment`), `${path}.environment`);
     }
     if (test["depends_on"] !== undefined) {
-      for (const service of stringArrayAt(test["depends_on"], `${path}.depends_on`)) {
+      const dependencies = stringArrayAt(test["depends_on"], `${path}.depends_on`);
+      uniqueAt(dependencies, `${path}.depends_on`);
+      for (const service of dependencies) {
         if (!Object.hasOwn(services, service)) fail(`${path}.depends_on`, `references unknown service ${service}`);
       }
     }
+    if (test["inputs"] !== undefined) {
+      const inputs = stringArrayAt(test["inputs"], `${path}.inputs`, { min: 1 });
+      inputs.forEach((input, index) => relativePathAt(input, `${path}.inputs[${index}]`));
+      uniqueAt(inputs, `${path}.inputs`);
+    }
+    if (test["requires"] !== undefined) {
+      const requirements = stringArrayAt(test["requires"], `${path}.requires`, { min: 1 });
+      requirements.forEach((requirement, index) => impactRequirementAt(requirement, `${path}.requires[${index}]`));
+      uniqueAt(requirements, `${path}.requires`);
+    }
+    if (test["tags"] !== undefined) {
+      const tags = stringArrayAt(test["tags"], `${path}.tags`, { min: 1 });
+      tags.forEach((tag, index) => identifierAt(tag, `${path}.tags[${index}]`));
+      uniqueAt(tags, `${path}.tags`);
+    }
+    optionalBooleanAt(test["cache"], `${path}.cache`);
+    optionalBooleanAt(test["always_run"], `${path}.always_run`);
     optionalPositiveIntegerAt(test["timeout_seconds"], `${path}.timeout_seconds`);
     optionalBooleanAt(test["default"], `${path}.default`);
   });
@@ -447,6 +476,14 @@ function relativePathAt(value: unknown, path: string): string {
 
 function optionalRelativePathAt(value: unknown, path: string): void {
   if (value !== undefined) relativePathAt(value, path);
+}
+
+function impactRequirementAt(value: unknown, path: string): string {
+  const requirement = stringAt(value, path);
+  if (!/^(?:runtime|build|terraform|clone|adapter|service|test):[^\s:\0][^\s\0]*$/.test(requirement)) {
+    fail(path, "must be a namespaced impact node such as service:api or terraform:infra");
+  }
+  return requirement;
 }
 
 function secretReferenceAt(value: unknown, path: string): SecretReference {

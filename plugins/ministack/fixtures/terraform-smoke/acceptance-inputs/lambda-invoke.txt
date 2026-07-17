@@ -1,0 +1,1 @@
+Lambda invocation acceptance contract v1

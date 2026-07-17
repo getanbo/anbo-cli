@@ -33,11 +33,14 @@ Run these commands from a project containing Terraform:
 ```sh
 anbo configure --target ministack
 anbo doctor --output jsonl
+anbo impact --output json
 anbo deploy --output jsonl
 anbo status --output jsonl
-anbo test --output jsonl -- npm test
+anbo test --affected --output jsonl
+anbo verify --full --output jsonl
 anbo logs --follow --output jsonl
 anbo debug --output jsonl
+anbo recover --stale --output jsonl
 anbo run --output jsonl -- node -e 'console.log("ready")'
 anbo reset --no-test --output jsonl
 anbo down --purge --output jsonl
@@ -48,6 +51,11 @@ If Terraform or Dockerfiles are added after the initial configuration, run
 empty-project placeholder automatically without replacing user configuration.
 
 `anbo sandbox up` remains an alias for `anbo deploy --target ministack`.
+Eligible MiniStack deploys skip unchanged phases and run affected
+default-policy tests. Use
+`anbo deploy --verify affected|full|none` to choose the confidence level, and
+see the plugin's [selective execution guide](plugins/ministack/docs/selective-execution.md)
+for manifest dependencies, conservative fallback, and machine-readable plans.
 
 ## Cloud Project
 

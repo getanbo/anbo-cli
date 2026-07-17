@@ -102,6 +102,8 @@ export interface MiniStackRuntime {
   volumeName?: string;
   hostEndpoint: string;
   containerEndpoint: string;
+  /** Stable endpoint injected into Lambda worker containers on the runtime network. */
+  lambdaEndpoint: string;
   image: string;
   /** Native Docker server platform selected from the pinned image index. */
   platform: CertifiedMiniStackPlatform;
@@ -133,6 +135,17 @@ const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/i;
 const RUNTIME_CONFIG_LABEL = "anbo.dev/runtime-config";
 const COMPATIBILITY_LABEL = "anbo.dev/ministack-compatibility";
 const CERTIFICATION_IMAGE_REPOSITORY = "anbo/ministack-certification";
+const MINISTACK_RUNTIME_ALIAS = "ministack";
+const LAMBDA_CERTIFICATION_VERSION = "lambda-callback-v6-lifecycle-cleanup";
+const MANAGED_RUNTIME_ENVIRONMENT = new Set([
+  "DOCKER_NETWORK",
+  "LAMBDA_DOCKER_NETWORK",
+  "LAMBDA_EXECUTOR",
+  "LAMBDA_STRICT",
+  "LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT",
+  "MINISTACK_ACCOUNT_ID",
+  "MINISTACK_REGION",
+]);
 
 class MiniStackCompatibilityCertificationError extends Error {}
 
@@ -181,8 +194,13 @@ export async function startMiniStack(
   const networkName = `anbo-${projectId}-control`;
   const runtimeNetworkName = `anbo-${projectId}-runtime`;
   const volumeName = config.persistence ? `anbo-${projectId}-ministack-data` : undefined;
+  const lambdaEndpoint = `http://${MINISTACK_RUNTIME_ALIAS}:4566`;
   const label = `anbo.dev/project=${projectId}`;
-  const lambdaDockerFlags = lambdaContainerFlags(config.environment?.["LAMBDA_DOCKER_FLAGS"]);
+  const lambdaDockerFlags = lambdaContainerFlags(
+    config.environment?.["LAMBDA_DOCKER_FLAGS"],
+    lambdaEndpoint,
+    runtimeNetworkName,
+  );
   const runtimeConfigFingerprint = miniStackRuntimeConfigFingerprint({
     config,
     image,
@@ -191,6 +209,7 @@ export async function startMiniStack(
     networkName,
     runtimeNetworkName,
     volumeName,
+    lambdaEndpoint,
     lambdaDockerFlags,
     compatibility,
   });
@@ -246,11 +265,13 @@ export async function startMiniStack(
       ...(compatibility === undefined ? [] : ["--label", `${COMPATIBILITY_LABEL}=${compatibility.fingerprint}`]),
       "--label", `${RUNTIME_CONFIG_LABEL}=${runtimeConfigFingerprint}`,
       "--network", runtimeNetworkName,
+      "--network-alias", MINISTACK_RUNTIME_ALIAS,
       "--add-host", "host.docker.internal:host-gateway",
       "--publish", `127.0.0.1:${hostPort}:4566`,
       "--volume", `${dockerSocket}:/var/run/docker.sock`,
       "--env", "DOCKER_NETWORK=" + runtimeNetworkName,
       "--env", "LAMBDA_EXECUTOR=docker",
+      "--env", "LAMBDA_STRICT=1",
       "--env", `LAMBDA_DOCKER_FLAGS=${lambdaDockerFlags}`,
       "--env", `MINISTACK_REGION=${config.region ?? "us-east-1"}`,
       "--env", `MINISTACK_ACCOUNT_ID=${config.accountId ?? "000000000000"}`,
@@ -267,6 +288,7 @@ export async function startMiniStack(
         : []),
       ...environmentArguments(config.environment, new Set([
         "LAMBDA_DOCKER_FLAGS",
+        ...MANAGED_RUNTIME_ENVIRONMENT,
         ...(isCertifiedMiniStackImage(image)
           ? Object.values(CERTIFIED_MINISTACK_COMPATIBILITY).flatMap((recipe) => Object.keys(recipe.environment))
           : []),
@@ -321,12 +343,15 @@ export async function startMiniStack(
               image,
               runtimeImageId,
               compatibility,
+              runtimeNetworkName,
+              lambdaEndpoint,
               signal: dependencies.signal,
               redact,
             });
           } catch (error) {
             throw new MiniStackCompatibilityCertificationError(
               error instanceof Error ? error.message : String(error),
+              { cause: error },
             );
           }
           compatibilityMetadata = {
@@ -353,6 +378,7 @@ export async function startMiniStack(
           ...(volumeName === undefined ? {} : { volumeName }),
           hostEndpoint,
           containerEndpoint: `http://${containerName}:4566`,
+          lambdaEndpoint,
           image,
           platform,
           serverPlatform,
@@ -428,12 +454,18 @@ function selectedCompatibility(
     Object.entries(recipe.environment).sort(([left], [right]) => left.localeCompare(right)),
   );
   const fingerprint = `sha256:${createHash("sha256").update(JSON.stringify({
-    version: 1,
+    version: 2,
     image,
     platform,
     id: recipe.id,
     environment,
     certification: recipe.certification,
+    lambda_certification: {
+      version: LAMBDA_CERTIFICATION_VERSION,
+      script_sha256: createHash("sha256")
+        .update(arm64CertificationScript(`http://${MINISTACK_RUNTIME_ALIAS}:4566`))
+        .digest("hex"),
+    },
   })).digest("hex")}` as const;
   return {
     id: recipe.id,
@@ -444,24 +476,96 @@ function selectedCompatibility(
   };
 }
 
-const ARM64_CERTIFICATION_SCRIPT = [
-  "import json, platform",
-  "import asyncssh, boto3",
-  "from cryptography.hazmat.primitives.asymmetric import ed25519",
-  "architecture = platform.machine().lower()",
-  "assert architecture in ('aarch64', 'arm64'), architecture",
-  "message = b'anbo-ministack-arm64-certification'",
-  "private_key = ed25519.Ed25519PrivateKey.generate()",
-  "private_key.public_key().verify(private_key.sign(message), message)",
-  "kms = boto3.client('kms', endpoint_url='http://127.0.0.1:4566', region_name='us-east-1', aws_access_key_id='999999999997', aws_secret_access_key='test')",
-  "key_id = kms.create_key(KeyUsage='ENCRYPT_DECRYPT')['KeyMetadata']['KeyId']",
-  "data_key = kms.generate_data_key(KeyId=key_id, KeySpec='AES_256')",
-  "assert len(data_key['Plaintext']) == 32 and len(data_key['CiphertextBlob']) > 0",
-  "ciphertext = kms.encrypt(KeyId=key_id, Plaintext=message)['CiphertextBlob']",
-  "assert kms.decrypt(CiphertextBlob=ciphertext)['Plaintext'] == message",
-  "kms.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)",
-  "print(json.dumps({'architecture': architecture, 'asyncssh': asyncssh.__version__, 'ed25519': True, 'kms': True}, sort_keys=True))",
-].join("; ");
+function arm64CertificationScript(lambdaEndpoint: string): string {
+  const handler = [
+    "import json, os",
+    "import boto3",
+    "def handler(event, _context):",
+    "    endpoint = os.environ['AWS_ENDPOINT_URL']",
+    "    common = {'endpoint_url': endpoint, 'region_name': 'us-east-1', 'aws_access_key_id': '999999999997', 'aws_secret_access_key': 'test'}",
+    "    boto3.client('dynamodb', **common).put_item(TableName=event['table'], Item={'pk': {'S': 'lambda'}})",
+    "    boto3.client('sqs', **common).send_message(QueueUrl=event['queue_url'], MessageBody='lambda')",
+    "    return {'endpoint': endpoint, 'callback': True}",
+  ].join("\n");
+  return [
+    "import io, json, platform, uuid, zipfile",
+    "import asyncssh, boto3",
+    "from botocore.config import Config",
+    "from botocore.exceptions import ClientError",
+    "from cryptography.hazmat.primitives.asymmetric import ed25519",
+    "architecture = platform.machine().lower()",
+    "assert architecture in ('aarch64', 'arm64'), architecture",
+    "message = b'anbo-ministack-arm64-certification'",
+    "private_key = ed25519.Ed25519PrivateKey.generate()",
+    "private_key.public_key().verify(private_key.sign(message), message)",
+    "common = {'endpoint_url': " + JSON.stringify(lambdaEndpoint) + ", 'region_name': 'us-east-1', 'aws_access_key_id': '999999999997', 'aws_secret_access_key': 'test'}",
+    "suffix = uuid.uuid4().hex[:12]",
+    "table_name = 'anbo-lambda-canary-' + suffix",
+    "queue_name = table_name",
+    "function_name = 'anbo-lambda-canary-' + suffix",
+    "kms = boto3.client('kms', **common)",
+    "ddb = boto3.client('dynamodb', **common)",
+    "sqs = boto3.client('sqs', **common)",
+    "lambdas = boto3.client('lambda', config=Config(connect_timeout=5, read_timeout=20, retries={'max_attempts': 0}), **common)",
+    "not_found_codes = {'NotFoundException', 'ResourceNotFoundException', 'QueueDoesNotExist', 'AWS.SimpleQueueService.NonExistentQueue'}",
+    "cleanup_errors = []",
+    "def cleanup_resource(label, operation):",
+    "    try:",
+    "        operation()",
+    "    except ClientError as error:",
+    "        code = error.response.get('Error', {}).get('Code', '')",
+    "        if code not in not_found_codes:",
+    "            cleanup_errors.append(label + ': ' + (code + ': ' if code else '') + str(error))",
+    "    except Exception as error:",
+    "        cleanup_errors.append(label + ': ' + str(error))",
+    "key_id = None",
+    "queue_url = None",
+    "probe_failure = None",
+    "try:",
+    "    key_id = kms.create_key(KeyUsage='ENCRYPT_DECRYPT', Description='anbo-ministack-arm64-certification-' + suffix)['KeyMetadata']['KeyId']",
+    "    data_key = kms.generate_data_key(KeyId=key_id, KeySpec='AES_256')",
+    "    assert len(data_key['Plaintext']) == 32 and len(data_key['CiphertextBlob']) > 0",
+    "    ciphertext = kms.encrypt(KeyId=key_id, Plaintext=message)['CiphertextBlob']",
+    "    assert kms.decrypt(CiphertextBlob=ciphertext)['Plaintext'] == message",
+    "    ddb.create_table(TableName=table_name, KeySchema=[{'AttributeName': 'pk', 'KeyType': 'HASH'}], AttributeDefinitions=[{'AttributeName': 'pk', 'AttributeType': 'S'}], BillingMode='PAY_PER_REQUEST')",
+    "    queue_url = sqs.create_queue(QueueName=queue_name)['QueueUrl']",
+    "    archive = io.BytesIO()",
+    "    with zipfile.ZipFile(archive, 'w') as bundle:",
+    `        bundle.writestr('handler.py', ${JSON.stringify(handler)})`,
+    "    lambdas.create_function(FunctionName=function_name, Runtime='python3.12', Role='arn:aws:iam::000000000000:role/anbo-lambda-canary', Handler='handler.handler', Code={'ZipFile': archive.getvalue()}, Environment={'Variables': {'AWS_ENDPOINT_URL': " + JSON.stringify(lambdaEndpoint) + ", 'ANBO_MINISTACK_ENDPOINT': " + JSON.stringify(lambdaEndpoint) + "}})",
+    "    response = lambdas.invoke(FunctionName=function_name, InvocationType='RequestResponse', Payload=json.dumps({'table': table_name, 'queue_url': queue_url}).encode())",
+    "    payload = json.loads(response['Payload'].read())",
+    "    assert response['StatusCode'] == 200 and 'FunctionError' not in response, (response, payload)",
+    "    assert payload == {'endpoint': " + JSON.stringify(lambdaEndpoint) + ", 'callback': True}, payload",
+    "    assert ddb.get_item(TableName=table_name, Key={'pk': {'S': 'lambda'}}).get('Item') is not None",
+    "    assert len(sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1).get('Messages', [])) == 1",
+    "except Exception as error:",
+    "    probe_failure = error",
+    "finally:",
+    "    cleanup_resource('lambda function', lambda: lambdas.delete_function(FunctionName=function_name))",
+    "    if queue_url is None:",
+    "        try:",
+    "            queue_url = sqs.get_queue_url(QueueName=queue_name)['QueueUrl']",
+    "        except ClientError as error:",
+    "            code = error.response.get('Error', {}).get('Code', '')",
+    "            if code not in not_found_codes:",
+    "                cleanup_errors.append('SQS queue lookup: ' + (code + ': ' if code else '') + str(error))",
+    "        except Exception as error:",
+    "            cleanup_errors.append('SQS queue lookup: ' + str(error))",
+    "    if queue_url is not None:",
+    "        cleanup_resource('SQS queue', lambda: sqs.delete_queue(QueueUrl=queue_url))",
+    "    cleanup_resource('DynamoDB table', lambda: ddb.delete_table(TableName=table_name))",
+    "    if key_id is not None:",
+    "        cleanup_resource('KMS key', lambda: kms.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7))",
+    "if probe_failure is not None:",
+    "    if cleanup_errors and hasattr(probe_failure, 'add_note'):",
+    "        probe_failure.add_note('cleanup failures: ' + '; '.join(cleanup_errors))",
+    "    raise probe_failure",
+    "if cleanup_errors:",
+    "    raise RuntimeError('certification cleanup failed: ' + '; '.join(cleanup_errors))",
+    "print(json.dumps({'architecture': architecture, 'asyncssh': asyncssh.__version__, 'ed25519': True, 'kms': True, 'lambda_reentrant': True}, sort_keys=True))",
+  ].join("\n");
+}
 
 async function certifyArm64Compatibility(options: {
   commands: CommandExecutor;
@@ -469,6 +573,8 @@ async function certifyArm64Compatibility(options: {
   image: string;
   runtimeImageId: string;
   compatibility: SelectedMiniStackCompatibility;
+  runtimeNetworkName: string;
+  lambdaEndpoint: string;
   signal: AbortSignal | undefined;
   redact: (text: string) => string;
 }): Promise<boolean> {
@@ -492,28 +598,68 @@ async function certifyArm64Compatibility(options: {
     }
   }
 
-  const probe = await options.commands.run(
-    "docker",
-    ["exec", options.containerName, "python", "-c", ARM64_CERTIFICATION_SCRIPT],
-    signalOptions(options.signal),
-  );
-  if (probe.code !== 0) {
-    const detail = probe.stderr.trim() || probe.stdout.trim() || `exit code ${probe.code}`;
-    throw new Error(
-      `MiniStack ARM64 compatibility certification failed: ${boundedTail(options.redact(detail), 8_192)}`,
-    );
-  }
-  const line = probe.stdout.trim().split("\n").filter(Boolean).at(-1);
-  let result: Record<string, unknown>;
+  const probeContainerName = `${options.containerName}-certification`;
+  let probeFailure: unknown;
   try {
-    result = JSON.parse(line ?? "") as Record<string, unknown>;
-  } catch {
-    throw new Error("MiniStack ARM64 compatibility certification returned malformed evidence");
+    const probe = await options.commands.run(
+      "docker",
+      [
+        "run", "--rm", "--name", probeContainerName,
+        "--platform", "linux/arm64",
+        "--network", options.runtimeNetworkName,
+        ...environmentArguments(options.compatibility.environment),
+        "--entrypoint", "python",
+        options.image,
+        "-c", arm64CertificationScript(options.lambdaEndpoint),
+      ],
+      signalOptions(options.signal),
+    );
+    if (probe.code !== 0) {
+      const detail = probe.stderr.trim() || probe.stdout.trim() || `exit code ${probe.code}`;
+      throw new Error(
+        `MiniStack ARM64 compatibility certification failed: ${boundedTail(options.redact(detail), 8_192)}`,
+      );
+    }
+    const line = probe.stdout.trim().split("\n").filter(Boolean).at(-1);
+    let result: Record<string, unknown>;
+    try {
+      result = JSON.parse(line ?? "") as Record<string, unknown>;
+    } catch {
+      throw new Error("MiniStack ARM64 compatibility certification returned malformed evidence");
+    }
+    if ((result["architecture"] !== "aarch64" && result["architecture"] !== "arm64") ||
+        typeof result["asyncssh"] !== "string" || result["ed25519"] !== true ||
+        result["kms"] !== true || result["lambda_reentrant"] !== true) {
+      throw new Error("MiniStack ARM64 compatibility certification returned incomplete evidence");
+    }
+  } catch (error) {
+    probeFailure = error;
   }
-  if ((result["architecture"] !== "aarch64" && result["architecture"] !== "arm64") ||
-      typeof result["asyncssh"] !== "string" || result["ed25519"] !== true || result["kms"] !== true) {
-    throw new Error("MiniStack ARM64 compatibility certification returned incomplete evidence");
+
+  let cleanupFailure: unknown;
+  try {
+    const cleanup = await options.commands.run(
+      "docker",
+      ["rm", "-f", probeContainerName],
+      { cleanup: true },
+    );
+    const detail = cleanup.stderr.trim() || cleanup.stdout.trim() || `exit code ${cleanup.code}`;
+    if (cleanup.code !== 0 && !/(?:no such|not found)/i.test(detail)) {
+      throw new Error(`MiniStack ARM64 compatibility certification cleanup failed: ${options.redact(detail)}`);
+    }
+  } catch (error) {
+    cleanupFailure = error;
   }
+  if (probeFailure !== undefined) {
+    if (cleanupFailure !== undefined && probeFailure instanceof Error) {
+      Object.defineProperty(probeFailure, "cleanupFailure", {
+        configurable: true,
+        value: cleanupFailure,
+      });
+    }
+    throw probeFailure;
+  }
+  if (cleanupFailure !== undefined) throw cleanupFailure;
 
   await checked(
     options.commands,
@@ -723,8 +869,21 @@ function environmentArguments(
     .flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
 
-function lambdaContainerFlags(configured: string | undefined): string {
-  return [configured?.trim(), "--add-host host.docker.internal:host-gateway"].filter(Boolean).join(" ");
+function lambdaContainerFlags(
+  configured: string | undefined,
+  lambdaEndpoint: string,
+  runtimeNetworkName: string,
+): string {
+  if (configured !== undefined && /(?:^|\s)--?(?:net|network)(?:=|\s|$)/i.test(configured)) {
+    throw new Error("LAMBDA_DOCKER_FLAGS cannot override the Anbo-managed Docker network");
+  }
+  return [
+    configured?.trim(),
+    "--add-host host.docker.internal:host-gateway",
+    `--env AWS_ENDPOINT_URL=${lambdaEndpoint}`,
+    `--env ANBO_MINISTACK_ENDPOINT=${lambdaEndpoint}`,
+    `--network ${runtimeNetworkName}`,
+  ].filter(Boolean).join(" ");
 }
 
 function parseDockerInspection(value: string): {
@@ -810,12 +969,14 @@ function miniStackRuntimeConfigFingerprint(options: {
   networkName: string;
   runtimeNetworkName: string;
   volumeName: string | undefined;
+  lambdaEndpoint: string;
   lambdaDockerFlags: string;
   compatibility: SelectedMiniStackCompatibility | undefined;
 }): string {
   const effectiveEnvironment: Record<string, string> = {
     DOCKER_NETWORK: options.runtimeNetworkName,
     LAMBDA_EXECUTOR: "docker",
+    LAMBDA_STRICT: "1",
     LAMBDA_DOCKER_FLAGS: options.lambdaDockerFlags,
     MINISTACK_REGION: options.config.region ?? "us-east-1",
     MINISTACK_ACCOUNT_ID: options.config.accountId ?? "000000000000",
@@ -832,6 +993,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     ...Object.fromEntries(
       Object.entries(options.config.environment ?? {})
         .filter(([key]) => key !== "LAMBDA_DOCKER_FLAGS" &&
+          !MANAGED_RUNTIME_ENVIRONMENT.has(key) &&
           !(isCertifiedMiniStackImage(options.image) && Object.values(CERTIFIED_MINISTACK_COMPATIBILITY)
             .some((recipe) => Object.prototype.hasOwnProperty.call(recipe.environment, key)))),
     ),
@@ -840,7 +1002,7 @@ function miniStackRuntimeConfigFingerprint(options: {
     Object.entries(effectiveEnvironment).sort(([left], [right]) => left.localeCompare(right)),
   );
   const createTimeConfiguration = {
-    version: 1,
+    version: 3,
     project_id: options.projectId,
     image: options.image,
     platform: options.platform,
@@ -851,9 +1013,12 @@ function miniStackRuntimeConfigFingerprint(options: {
     networks: {
       control: options.networkName,
       runtime: options.runtimeNetworkName,
+      runtime_alias: MINISTACK_RUNTIME_ALIAS,
     },
     port_binding: "127.0.0.1:dynamic:4566",
     host_gateway: "host.docker.internal:host-gateway",
+    lambda_code_delivery: "docker-cp",
+    lambda_endpoint: options.lambdaEndpoint,
     environment: stableEnvironment,
   };
   return createHash("sha256").update(JSON.stringify(createTimeConfiguration)).digest("hex");

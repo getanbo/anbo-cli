@@ -11,7 +11,10 @@ export type CommandAction =
   | "reset"
   | "down"
   | "capabilities"
-  | "cache";
+  | "cache"
+  | "impact"
+  | "verify"
+  | "recover";
 
 export enum ExitCode {
   Success = 0,
@@ -94,9 +97,18 @@ export interface BuildConfig {
 
 export interface TestConfig {
   command: string[];
-  service?: string;
+  service: string;
   environment?: Record<string, string>;
   depends_on?: string[];
+  /** Project-relative files or glob patterns that can affect this test. */
+  inputs?: string[];
+  /** Namespaced impact nodes, such as service:api or terraform:infra. */
+  requires?: string[];
+  tags?: string[];
+  /** False makes this test run on every affected plan. */
+  cache?: boolean;
+  /** Always run this test, including on an otherwise unchanged project. */
+  always_run?: boolean;
   timeout_seconds?: number;
   default?: boolean;
 }

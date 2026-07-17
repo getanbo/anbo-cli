@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/getanbo/anbo-plugin-ministack/v0.1.0/schemas/sandbox.v2.schema.json",
+  "$schema": "https://raw.githubusercontent.com/getanbo/anbo-cli/main/plugins/ministack/schemas/sandbox.v2.schema.json",
   "schema_version": 2,
   "project": {
     "name": "anbo-terraform-smoke"
@@ -35,13 +35,38 @@
     }
   },
   "tests": {
-    "terraform-smoke": {
-      "command": ["node", "runner/smoke.mjs"],
+    "terraform-resources": {
+      "command": ["node", "runner/smoke-resources.mjs"],
       "service": "runner",
       "depends_on": ["runner"],
+      "inputs": [
+        "acceptance-inputs/terraform-resources.txt",
+        "runner/smoke-resources.mjs"
+      ],
+      "requires": ["terraform:infra"],
+      "tags": ["acceptance", "terraform"],
+      "cache": true,
       "timeout_seconds": 60,
       "default": true,
       "environment": {
+        "ANBO_TEST_PROTOCOL": "jsonl-v1"
+      }
+    },
+    "lambda-invoke": {
+      "command": ["node", "runner/smoke-lambda.mjs"],
+      "service": "runner",
+      "depends_on": ["runner"],
+      "inputs": [
+        "acceptance-inputs/lambda-invoke.txt",
+        "runner/smoke-lambda.mjs"
+      ],
+      "requires": ["terraform:infra"],
+      "tags": ["acceptance", "lambda"],
+      "cache": true,
+      "timeout_seconds": 60,
+      "default": true,
+      "environment": {
+        "ANBO_FORCE_TEST_FAILURE": "0",
         "ANBO_TEST_PROTOCOL": "jsonl-v1"
       }
     }

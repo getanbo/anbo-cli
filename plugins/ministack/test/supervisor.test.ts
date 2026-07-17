@@ -66,6 +66,160 @@ test("enforces one operation lock and recovers a stale dead-owner lock", async (
   await recovered.release();
 });
 
+test("recovers dead, zombie, and reused-PID operation leases", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "anbo-supervisor-leases-"));
+  const now = new Date();
+  const future = new Date(now.getTime() + 60_000).toISOString();
+  const cases = [
+    {
+      name: "dead owner",
+      processStartTime: "owner-start",
+      leaseExpiresAt: future,
+      inspection: { alive: false, zombie: false },
+    },
+    {
+      name: "zombie owner",
+      processStartTime: "owner-start",
+      leaseExpiresAt: future,
+      inspection: { alive: true, zombie: true, processStartTime: "owner-start" },
+    },
+    {
+      name: "reused PID",
+      processStartTime: "previous-process-start",
+      leaseExpiresAt: future,
+      inspection: { alive: true, zombie: false, processStartTime: "replacement-process-start" },
+    },
+  ] as const;
+
+  for (const [index, scenario] of cases.entries()) {
+    await t.test(scenario.name, async () => {
+      const lockPath = join(root, `operation-${index}.lock`);
+      await writeFile(
+        lockPath,
+        `${JSON.stringify({
+          schema_version: 2,
+          operation_id: `op_abandoned_${index}`,
+          kind: "deploy",
+          pid: 424_242,
+          project_root: root,
+          created_at: now.toISOString(),
+          heartbeat_at: now.toISOString(),
+          process_start_time: scenario.processStartTime,
+          lease_expires_at: scenario.leaseExpiresAt,
+        })}\n`,
+      );
+
+      const recovered = await FileOperationLock.acquire(lockPath, {
+        operationId: `op_recovered_${index}`,
+        kind: "deploy",
+        projectRoot: root,
+        inspectProcess: async () => scenario.inspection,
+      });
+      assert.equal(recovered.metadata.schema_version, 2);
+      assert.equal(recovered.metadata.operation_id, `op_recovered_${index}`);
+      assert.equal(typeof recovered.metadata.process_start_time, "string");
+      assert.equal(typeof recovered.metadata.lease_expires_at, "string");
+      await recovered.release();
+    });
+  }
+});
+
+test("does not steal an expired lease from the same live process generation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "anbo-supervisor-live-lease-"));
+  const lockPath = join(root, "operation.lock");
+  const now = new Date();
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({
+      schema_version: 2,
+      operation_id: "op_live",
+      kind: "deploy",
+      pid: 424_242,
+      project_root: root,
+      created_at: now.toISOString(),
+      heartbeat_at: now.toISOString(),
+      process_start_time: "owner-start",
+      lease_expires_at: new Date(now.getTime() - 1_000).toISOString(),
+    })}\n`,
+  );
+
+  await assert.rejects(
+    FileOperationLock.acquire(lockPath, {
+      operationId: "op_contender",
+      kind: "deploy",
+      projectRoot: root,
+      inspectProcess: async () => ({
+        alive: true,
+        zombie: false,
+        processStartTime: "owner-start",
+      }),
+    }),
+    OperationLockedError,
+  );
+});
+
+test("observational operations remain available while a mutation owns the project lease", async () => {
+  const stateHome = await mkdtemp(join(tmpdir(), "anbo-supervisor-observe-"));
+  const projectRoot = await mkdtemp(join(tmpdir(), "anbo-project-observe-"));
+  const supervisor = new ProjectSupervisor({ projectRoot, stateHome });
+  let notifyStarted!: () => void;
+  let finishMutation!: () => void;
+  const started = new Promise<void>((resolveStarted) => {
+    notifyStarted = resolveStarted;
+  });
+  const held = new Promise<void>((resolveHeld) => {
+    finishMutation = resolveHeld;
+  });
+  const mutation = supervisor.runOperation(
+    { kind: "deploy", operationId: "op_mutation" },
+    async () => {
+      notifyStarted();
+      await held;
+      return "deployed";
+    },
+  );
+
+  await started;
+  try {
+    for (const kind of ["status", "logs", "debug", "capabilities", "impact"]) {
+      const observed = await supervisor.runOperation(
+        { kind, operationId: `op_${kind}` },
+        async () => kind,
+      );
+      assert.equal(observed, kind);
+      assert.equal((await supervisor.readState())?.active_operation?.operation_id, "op_mutation");
+    }
+
+    const cacheInspection = await supervisor.runOperation(
+      { kind: "cache", operationId: "op_cache_inspect", lockMode: "observational" },
+      async () => "cache",
+    );
+    assert.equal(cacheInspection, "cache");
+    assert.equal((await supervisor.readState())?.active_operation?.operation_id, "op_mutation");
+
+    await assert.rejects(
+      supervisor.runOperation({ kind: "test", operationId: "op_second_mutation" }, async () => undefined),
+      OperationLockedError,
+    );
+    await assert.rejects(
+      supervisor.runOperation({ kind: "cache", operationId: "op_cache_prune" }, async () => undefined),
+      OperationLockedError,
+    );
+    await assert.rejects(
+      supervisor.runOperation(
+        { kind: "status", operationId: "op_forced_exclusive", lockMode: "exclusive" },
+        async () => undefined,
+      ),
+      OperationLockedError,
+    );
+  } finally {
+    finishMutation();
+  }
+
+  assert.equal(await mutation, "deployed");
+  assert.equal((await supervisor.readState())?.active_operation, undefined);
+});
+
 test("persists secret-free state and rejects credential material", async () => {
   const stateHome = await mkdtemp(join(tmpdir(), "anbo-supervisor-"));
   const projectRoot = await mkdtemp(join(tmpdir(), "anbo-project-"));

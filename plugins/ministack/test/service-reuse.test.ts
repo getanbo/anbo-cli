@@ -6,10 +6,12 @@ import type { CommandExecutor, RuntimeCommandOptions, RuntimeCommandResult } fro
 import {
   refreshRuntimeBoundServices,
   startDeclaredServices,
+  validateDeclaredServices,
   type ServiceRuntimeContext,
 } from "../src/runtime/services.js";
 
 interface FakeContainer {
+  id: string;
   labels: Record<string, string>;
   running: boolean;
   healthy: boolean;
@@ -38,6 +40,7 @@ class ServiceExecutor implements CommandExecutor {
       return {
         code: 0,
         stdout: JSON.stringify([{
+          Id: container.id,
           State: {
             Running: container.running,
             Paused: container.paused ?? false,
@@ -61,7 +64,7 @@ class ServiceExecutor implements CommandExecutor {
         const separator = label.indexOf("=");
         return [label.slice(0, separator), label.slice(separator + 1)];
       }));
-      this.containers.set(name, { labels, running: true, healthy: true });
+      this.containers.set(name, { id: `${name}-id`, labels, running: true, healthy: true });
       this.starts.push(name);
       return { code: 0, stdout: `${name}-id\n`, stderr: "" };
     }
@@ -90,6 +93,11 @@ class ServiceExecutor implements CommandExecutor {
 
   changeImage(image: string): void {
     this.imageIdentities.set(image, `sha256:${image}-changed`);
+  }
+
+  replaceIdentity(containerName: string): void {
+    const container = this.containers.get(containerName);
+    if (container !== undefined) container.id = `${container.id}-replaced`;
   }
 }
 
@@ -190,6 +198,22 @@ test("paused or Docker-unhealthy containers are never reused", async () => {
   commands.markNativeUnhealthy("anbo-checkout-api");
   await startDeclaredServices(services, context, { commands });
   assert.deepEqual(commands.starts, ["anbo-checkout-api"]);
+});
+
+test("fast-path validation requires the persisted container identity, labels, fingerprint, and health", async () => {
+  const commands = new ServiceExecutor();
+  const services: Record<string, ServiceConfig> = {
+    api: { image: "api:test" },
+  };
+  const context = serviceContext();
+  const deployed = await startDeclaredServices(services, context, { commands });
+
+  assert.equal(await validateDeclaredServices(services, context, deployed, { commands }), true);
+  const withoutIdentity = structuredClone(deployed);
+  delete withoutIdentity.api?.containerId;
+  assert.equal(await validateDeclaredServices(services, context, withoutIdentity, { commands }), false);
+  commands.replaceIdentity("anbo-checkout-api");
+  assert.equal(await validateDeclaredServices(services, context, deployed, { commands }), false);
 });
 
 test("cancelling a warm health probe never removes the reusable service", async () => {

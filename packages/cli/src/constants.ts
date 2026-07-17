@@ -21,6 +21,9 @@ export const LIFECYCLE = new Set([
   "run",
   "reset",
   "down",
+  "impact",
+  "verify",
+  "recover",
   "doctor",
 ]);
 

@@ -21,7 +21,12 @@ import {
   type DeployRequest,
   type RunSummary,
 } from "./types.js";
-import { buildDeclaredImages, pruneBuildCache, type BuildResult } from "./runtime/cache.js";
+import {
+  buildDeclaredImages,
+  pruneBuildCache,
+  validateDeclaredBuildCache,
+  type BuildResult,
+} from "./runtime/cache.js";
 import {
   AmbiguousCloneCreateError,
   acquireConfiguredClones,
@@ -37,6 +42,7 @@ import {
   safeProjectId,
   startMiniStack,
   stopMiniStack,
+  type CommandExecutor,
   type MiniStackRuntime,
 } from "./runtime/ministack.js";
 import {
@@ -46,7 +52,9 @@ import {
   runConfiguredTests,
   runtimeBoundServiceNames,
   startDeclaredServices,
+  stopDeclaredService,
   stopDeclaredServices,
+  validateDeclaredServices,
   type RunningService,
   type ServiceRuntimeContext,
 } from "./runtime/services.js";
@@ -69,10 +77,41 @@ import {
 } from "./runtime/terraform-reconciliation.js";
 import { injectLambdaCloneBindings } from "./runtime/lambda-overlays.js";
 import { isSensitiveKey } from "./redaction.js";
+import {
+  createProjectImpactGraph,
+  fingerprintValue,
+  impactNodeId,
+  impactPlanDocument,
+  planImpact,
+  readImpactLedger,
+  updateImpactLedger,
+  writeImpactLedger,
+  type ImpactExecutionResult,
+  type ImpactGraph,
+  type ImpactLedger,
+  type ImpactLedgerReadResult,
+  type ImpactPlan,
+  type ImpactPlanMode,
+} from "./impact/index.js";
 
 interface PersistedRuntimeState extends SupervisorState {
   status?: string;
   last_run_id?: string;
+  deployment?: {
+    status: "ready" | "failed";
+    phase: string;
+    completed_at?: string;
+    run_id?: string;
+  };
+  verification?: {
+    status: "pending" | "passed" | "failed" | "skipped";
+    mode?: "affected" | "full" | "none";
+    run_id?: string;
+    completed_at?: string;
+    tests?: Record<string, { passed: boolean; code: number }>;
+    failed_tests?: string[];
+    attestation?: VerificationAttestation;
+  };
   ministack?: {
     container_name: string;
     container_id?: string;
@@ -95,7 +134,13 @@ interface PersistedRuntimeState extends SupervisorState {
     pending_roots?: string[];
     reconciliation?: PersistedTerraformReconciliation;
   };
+  builds?: Record<string, {
+    cache_hit: boolean;
+    fingerprint: string;
+    image?: string;
+  }>;
   services?: Record<string, RunningService>;
+  adapters?: string[];
   clones?: Record<string, unknown>;
   last_failure?: {
     code: string;
@@ -103,6 +148,27 @@ interface PersistedRuntimeState extends SupervisorState {
     remediation: string;
     phase: string;
   };
+}
+
+interface VerificationAttestation {
+  schema_version: 1;
+  mode: "full";
+  run_id: string;
+  completed_at: string;
+  graph_fingerprint: string;
+  plan_fingerprint: string;
+  runtime_generation?: string;
+  terraform_fingerprint?: string;
+  tests: string[];
+  digest: string;
+}
+
+interface PreparedImpact {
+  path: string;
+  graph: ImpactGraph;
+  ledger: ImpactLedger;
+  ledgerRead: ImpactLedgerReadResult;
+  plan: ImpactPlan;
 }
 
 interface PersistedTerraformRootReconciliation {
@@ -126,6 +192,7 @@ interface TerraformRootDecision extends PersistedTerraformRootReconciliation {
   skipped: boolean;
   reconciled: boolean;
   reason: string;
+  changes: TerraformChangeSummary;
 }
 
 interface TerraformDeployResult extends TerraformRunResult {
@@ -141,6 +208,17 @@ const defaultCommands = new ProcessCommandExecutor();
 const DEFAULT_TERRAFORM_WORKER = "hashicorp/terraform:1.15.7@sha256:40e61a86763083ea987ded0ffa15f6d75e0df48ed16275811f949b3ecbcd8aae";
 const TERRAFORM_FINGERPRINT_MATCH = "terraform_reconciliation_fingerprint_match";
 const TERRAFORM_RECONCILE_REQUESTED = "terraform_reconcile_requested";
+
+function operationLockMode(request: DeployRequest): "exclusive" | "observational" {
+  if (request.action === "cache") return request.args[0] === "prune" ? "exclusive" : "observational";
+  return request.action === "status" ||
+    request.action === "logs" ||
+    request.action === "debug" ||
+    request.action === "capabilities" ||
+    request.action === "impact"
+    ? "observational"
+    : "exclusive";
+}
 
 export async function runDeploy(request: DeployRequest, sink: PluginEventSink): Promise<RunSummary> {
   const logicalProjectId = request.manifest.project.id ?? request.manifest.project.name;
@@ -160,6 +238,7 @@ export async function runDeploy(request: DeployRequest, sink: PluginEventSink): 
   try {
     const summary = await supervisor.runOperation({
       kind: request.action,
+      lockMode: operationLockMode(request),
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     }, async (operation) => {
       try {
@@ -185,6 +264,17 @@ export async function runDeploy(request: DeployRequest, sink: PluginEventSink): 
             return { action: "capabilities", status: "succeeded", capabilities: getCapabilityReport() } satisfies RunSummary;
           case "cache":
             return await cacheCommand(request, projectId, cacheHome, operation.signal);
+          case "impact":
+            return await impactSandbox(request, supervisor, sink, operation.signal);
+          case "verify":
+            return await verifySandbox(request, supervisor, sink, operation.signal, (next) => { phase = next; });
+          case "recover":
+            return {
+              action: "recover",
+              status: "succeeded",
+              recovered: true,
+              project_id: projectId,
+            } satisfies RunSummary;
         }
       } catch (cause) {
         const classified = classifyRuntimeError(cause, phase, operation.signal);
@@ -199,14 +289,28 @@ export async function runDeploy(request: DeployRequest, sink: PluginEventSink): 
             evidence: classified.details?.evidence ?? { phase: failurePhase },
           },
         });
-        const observational = request.action === "status" || request.action === "logs" || request.action === "debug" ||
-          request.action === "capabilities" || request.action === "cache";
+        const observational = operationLockMode(request) === "observational";
         if (!observational) {
           const current = await supervisor.readState<PersistedRuntimeState>().catch(() => undefined);
           const runtimeInvalidated = request.action === "deploy" || request.action === "reset" || request.action === "down";
+          const verificationOnlyFailure = failurePhase === "test" && current?.deployment?.status === "ready";
+          const verificationAttemptFailure = current?.status === "ready" &&
+            (verificationOnlyFailure || request.action === "test" || request.action === "verify");
+          const evidence = classified.details?.evidence;
+          const failedTestId = isRecord(evidence) && typeof evidence["test_id"] === "string"
+            ? evidence["test_id"]
+            : undefined;
           await supervisor.writeState({
             ...(current ?? {}),
-            ...(runtimeInvalidated ? { status: "failed" } : {}),
+            ...(runtimeInvalidated && !verificationOnlyFailure
+              ? { status: "failed", deployment: { status: "failed", phase: failurePhase, run_id: sink.runId } }
+              : {}),
+            ...(verificationAttemptFailure
+              ? {
+                  status: "ready",
+                  verification: failedVerificationState(current?.verification, request, sink.runId, failedTestId),
+                }
+              : {}),
             last_operation: { action: request.action, status: "failed", phase: failurePhase },
             last_run_id: sink.runId,
             last_failure: {
@@ -238,6 +342,8 @@ async function deploySandbox(
   reportPhase: (phase: string) => void,
 ): Promise<RunSummary> {
   const projectId = supervisor.projectId;
+  const verificationMode = deployVerificationMode(request);
+  await assertNoUnreleasedAdapterRemoval(request, supervisor);
   if (resetting) {
     reportPhase("reset");
     const phase = await sink.startPhase("reset runtime", "anbo.runtime");
@@ -261,6 +367,19 @@ async function deploySandbox(
       });
     }
     await phase.finish();
+  }
+
+  if (!resetting && verificationMode !== "full" && request.flags["reconcile"] !== true) {
+    const fast = await selectiveDeployFastPath(
+      request,
+      supervisor,
+      sink,
+      signal,
+      verificationMode,
+      reportPhase,
+      cacheHome,
+    );
+    if (fast !== undefined) return fast;
   }
 
   reportPhase("infrastructure");
@@ -416,29 +535,66 @@ async function deploySandbox(
     adapterBindings: Object.fromEntries(Object.entries(adapters).map(([name, response]) => [name, response.bindings])),
     signal,
   };
+  const restartedServices = new Set<string>();
   const services = await startDeclaredServices(request.manifest.services, serviceContext, {
     commands: request.commands ?? defaultCommands,
     ...(request.fetch === undefined ? {} : { fetch: request.fetch }),
-    onStatus: (service, status) => void sink.emit({ kind: "service.status", phase: "services", source: "docker", service, level: "info", message: `${service} ${status}`, fields: { status } }),
+    onStatus: (service, status) => {
+      if (status === "starting") restartedServices.add(service);
+      void sink.emit({ kind: "service.status", phase: "services", source: "docker", service, level: "info", message: `${service} ${status}`, fields: { status } });
+    },
   });
   await servicesPhase.finish("application services ready", { services: Object.keys(services) });
 
-  let tests: Record<string, { passed: boolean; code: number }> = {};
-  if (request.flags.test !== false && request.flags["no-test"] !== true) {
-    reportPhase("test");
-    const testPhase = await sink.startPhase("default smoke tests", "smoke");
-    tests = await runConfiguredTests(request.manifest.tests, [], serviceContext, services, {
-      commands: request.commands ?? defaultCommands,
-      ...configuredTestFeedback(sink),
-    });
-    for (const [name, result] of Object.entries(tests)) await sink.assertion({ name, passed: result.passed, actual: result.code }, { testId: name });
-    await testPhase.finish("default smoke tests passed", { tests: Object.keys(tests) });
-  }
+  reportPhase("impact");
+  const impactAdapterResponses = await invokeImpactAdapters(request, sink, signal, {
+    ministack_endpoint: miniStack.hostEndpoint,
+    terraform_outputs: terraform.outputs,
+    clone_engines: Object.keys(clones),
+    services: Object.keys(services),
+  });
+  const impact = await prepareImpact(request, supervisor, sink, {
+    mode: resetting ? "cold" : verificationMode === "full" ? "full" : undefined,
+    forceNodeIds: [
+      ...terraform.rootDecisions
+        .filter((root) => terraformHasChanges(root.changes))
+        .map((root) => impactNodeId("terraform", root.root)),
+      ...Object.entries(builds)
+        .filter(([, result]) => !result.cacheHit)
+        .map(([name]) => impactNodeId("build", name)),
+      ...[...restartedServices].map((service) => impactNodeId("service", service)),
+    ],
+    adapterResponses: { ...adapters, ...impactAdapterResponses },
+    runtimeGeneration: miniStack.runtimeGeneration,
+  });
+  const selectedTests = selectDeployTests(request, impact.plan, verificationMode);
+  await applyImpactRemovals(impact, supervisor.projectId, request.commands ?? defaultCommands, signal);
+  await recordImpactResults(
+    impact,
+    impact.plan.executionOrder
+      .filter((id) => impact.graph.nodes.get(id)?.kind !== "test")
+      .map((id) => impactResult(impact, id, "succeeded")),
+  );
 
   reportPhase("state");
   const cloneState = await readCloneState(join(supervisor.stateDirectory, "clones.json"));
   await supervisor.writeState({
     status: "ready",
+    deployment: {
+      status: "ready",
+      phase: "service",
+      completed_at: new Date().toISOString(),
+      run_id: sink.runId,
+    },
+    verification: {
+      status: verificationMode === "none" ? "skipped" : selectedTests.length > 0 ? "pending" : "passed",
+      mode: verificationMode,
+      run_id: sink.runId,
+      ...(selectedTests.length === 0 && verificationMode !== "none"
+        ? { completed_at: new Date().toISOString(), tests: {} }
+        : {}),
+    },
+    last_operation: { action: resetting ? "reset" : "deploy", status: "succeeded", phase: "service" },
     last_run_id: sink.runId,
     ministack: persistedMiniStack(miniStack),
     terraform: {
@@ -446,7 +602,62 @@ async function deploySandbox(
       roots: [...request.manifest.terraform.roots],
       reconciliation: terraform.reconciliation,
     },
+    builds: persistedBuilds(builds),
     services,
+    adapters: Object.keys(request.manifest.adapters).sort(),
+    clones: cloneState?.clones ?? {},
+  });
+
+  let tests: Record<string, { passed: boolean; code: number }> = {};
+  if (selectedTests.length > 0) {
+    reportPhase("test");
+    const testPhase = await sink.startPhase(
+      verificationMode === "full" ? "full smoke verification" : "affected smoke tests",
+      "smoke",
+    );
+    tests = await runTestsWithImpact(
+      request,
+      selectedTests,
+      serviceContext,
+      services,
+      sink,
+      impact,
+    );
+    for (const [name, result] of Object.entries(tests)) await sink.assertion({ name, passed: result.passed, actual: result.code }, { testId: name });
+    await testPhase.finish("selected smoke tests passed", { tests: Object.keys(tests), mode: verificationMode });
+  }
+
+  const attestation = verificationMode === "full"
+    ? verificationAttestation(impact, sink.runId, Object.keys(tests), miniStack, terraform)
+    : undefined;
+  reportPhase("state");
+  await supervisor.writeState({
+    status: "ready",
+    deployment: {
+      status: "ready",
+      phase: "complete",
+      completed_at: new Date().toISOString(),
+      run_id: sink.runId,
+    },
+    verification: {
+      status: verificationMode === "none" ? "skipped" : "passed",
+      mode: verificationMode,
+      run_id: sink.runId,
+      completed_at: new Date().toISOString(),
+      tests,
+      ...(attestation === undefined ? {} : { attestation }),
+    },
+    last_operation: { action: resetting ? "reset" : "deploy", status: "succeeded", phase: "complete" },
+    last_run_id: sink.runId,
+    ministack: persistedMiniStack(miniStack),
+    terraform: {
+      outputs: terraform.outputs,
+      roots: [...request.manifest.terraform.roots],
+      reconciliation: terraform.reconciliation,
+    },
+    builds: persistedBuilds(builds),
+    services,
+    adapters: Object.keys(request.manifest.adapters).sort(),
     clones: cloneState?.clones ?? {},
   });
   return {
@@ -486,7 +697,328 @@ async function deploySandbox(
     adapters: safeAdapterSummary(adapters),
     services: Object.keys(services),
     tests,
+    impact: impactPlanDocument(impact.plan),
+    verification: {
+      mode: verificationMode,
+      selected_tests: selectedTests,
+      ...(attestation === undefined ? {} : { attestation }),
+    },
   };
+}
+
+async function selectiveDeployFastPath(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+  sink: PluginEventSink,
+  signal: AbortSignal,
+  verificationMode: "affected" | "none",
+  reportPhase: (phase: string) => void,
+  cacheHome: string,
+): Promise<RunSummary | undefined> {
+  const state = await supervisor.readState<PersistedRuntimeState>();
+  if (state?.status !== "ready" || state.deployment?.status !== "ready" || state.ministack === undefined) {
+    return undefined;
+  }
+  const requiresDynamicRefresh =
+    Object.values(request.manifest.data).some((config) => config !== undefined) ||
+    Object.keys(request.manifest.adapters).length > 0 ||
+    runtimeBoundServiceNames(request.manifest.services).length > 0;
+  if (requiresDynamicRefresh) return undefined;
+
+  reportPhase("impact");
+  const adapterResponses = await invokeImpactAdapters(request, sink, signal, { deployed: true, phase: "deploy-preview" });
+  const impact = await prepareImpact(request, supervisor, sink, {
+    adapterResponses,
+    runtimeGeneration: state.ministack.runtime_generation,
+  });
+  const nonTestExecution = impact.plan.executionOrder.filter(
+    (id) => impact.graph.nodes.get(id)?.kind !== "test",
+  );
+  const nonTestRemovals = impact.plan.removalOrder.filter(
+    (id) => impact.plan.removed.get(id)?.kind !== "test",
+  );
+  if (nonTestExecution.length > 0 || nonTestRemovals.length > 0) return undefined;
+  if (!await persistedDeploymentAlive(request, state, request.commands ?? defaultCommands, signal, sink.runId)) {
+    return undefined;
+  }
+  const buildFingerprints = Object.fromEntries(
+    Object.keys(request.manifest.builds).map((name) => {
+      const fingerprint = impact.graph.nodes.get(impactNodeId("build", name))?.fingerprint;
+      return [name, fingerprint?.slice("sha256:".length)];
+    }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
+  if (!await validateDeclaredBuildCache({
+    projectId: supervisor.projectId,
+    root: request.root,
+    builds: request.manifest.builds,
+    cacheRoot: join(cacheHome, "anbo", "v2", "buildkit"),
+    fingerprints: buildFingerprints,
+    signal,
+  }, { commands: request.commands ?? defaultCommands })) {
+    return undefined;
+  }
+
+  await applyImpactRemovals(impact, supervisor.projectId, request.commands ?? defaultCommands, signal);
+  const selectedTests = verificationMode === "none" ? [] : selectDeployTests(request, impact.plan, verificationMode);
+
+  if (selectedTests.length === 0) {
+    const completedAt = new Date().toISOString();
+    await supervisor.writeState({
+      ...state,
+      verification: {
+        status: verificationMode === "none" ? "skipped" : "passed",
+        mode: verificationMode,
+        run_id: sink.runId,
+        completed_at: completedAt,
+        tests: {},
+      },
+      last_operation: { action: "deploy", status: "succeeded", phase: "impact" },
+      last_run_id: sink.runId,
+      last_failure: undefined,
+    });
+    await sink.emit({
+      kind: "progress",
+      phase: "impact.fast-path",
+      source: "anbo.impact",
+      level: "info",
+      message: "Deployment graph is unchanged; expensive phases were skipped",
+      fields: { cache_hit: true, skipped_phases: ["build", "terraform", "service", "test"] },
+      redacted: true,
+    });
+    return fastDeploySummary(request, supervisor, state, impact, verificationMode, [], {});
+  }
+
+  const services = state.services ?? {};
+  const context = runtimeContextFromState(request, state, {}, {}, signal, sink.runId);
+  await supervisor.writeState({
+    ...state,
+    verification: {
+      status: "pending",
+      mode: verificationMode,
+      run_id: sink.runId,
+    },
+    last_operation: { action: "deploy", status: "succeeded", phase: "impact" },
+    last_run_id: sink.runId,
+    last_failure: undefined,
+  });
+  reportPhase("test");
+  const testPhase = await sink.startPhase("affected smoke tests", "smoke");
+  const tests = await runTestsWithImpact(request, selectedTests, context, services, sink, impact);
+  for (const [name, result] of Object.entries(tests)) {
+    await sink.assertion({ name, passed: result.passed, actual: result.code }, { testId: name });
+  }
+  await testPhase.finish("selected smoke tests passed", {
+    tests: Object.keys(tests),
+    mode: verificationMode,
+    skipped_phases: ["build", "terraform", "service"],
+  });
+  await supervisor.writeState({
+    ...state,
+    status: "ready",
+    verification: {
+      status: "passed",
+      mode: verificationMode,
+      run_id: sink.runId,
+      completed_at: new Date().toISOString(),
+      tests,
+    },
+    last_operation: { action: "deploy", status: "succeeded", phase: "test" },
+    last_run_id: sink.runId,
+    last_failure: undefined,
+  });
+  return fastDeploySummary(request, supervisor, state, impact, verificationMode, selectedTests, tests);
+}
+
+async function persistedDeploymentAlive(
+  request: DeployRequest,
+  state: PersistedRuntimeState,
+  commands: CommandExecutor,
+  signal: AbortSignal,
+  runId: string,
+): Promise<boolean> {
+  const miniStack = state.ministack;
+  if (miniStack === undefined) return false;
+  if (miniStack.container_id === undefined || miniStack.runtime_generation === undefined) return false;
+  const names = [
+    miniStack.container_name,
+    ...Object.values(state.services ?? {}).map((service) => service.containerName),
+  ];
+  const inspected = await commands.run("docker", ["inspect", ...names], { signal });
+  if (inspected.code !== 0) return false;
+  try {
+    const records = JSON.parse(inspected.stdout) as unknown;
+    if (!Array.isArray(records) || records.length !== names.length) return false;
+    const byName = new Map<string, Record<string, unknown>>();
+    for (const record of records) {
+      if (!isRecord(record) || typeof record["Name"] !== "string") return false;
+      byName.set(record["Name"].replace(/^\//, ""), record);
+    }
+    for (const name of names) {
+      const record = byName.get(name);
+      const runtimeState = record?.["State"];
+      if (!isRecord(runtimeState) || runtimeState["Running"] !== true) return false;
+    }
+    const runtime = byName.get(miniStack.container_name);
+    if (runtime?.["Id"] !== miniStack.container_id) return false;
+    const runtimeState = runtime?.["State"];
+    if (!isRecord(runtimeState) || runtimeState["StartedAt"] !== miniStack.runtime_generation) return false;
+    const healthSignal = AbortSignal.any([signal, AbortSignal.timeout(2_000)]);
+    const health = await (request.fetch ?? globalThis.fetch)(
+      `${miniStack.host_endpoint}/_ministack/health`,
+      { signal: healthSignal },
+    );
+    if (!health.ok) return false;
+    const healthBody = await health.json() as unknown;
+    if (!isRecord(healthBody) || healthBody["edition"] !== "full") return false;
+    const context = runtimeContextFromState(request, state, {}, {}, signal, runId);
+    return await validateDeclaredServices(
+      request.manifest.services,
+      context,
+      state.services ?? {},
+      {
+        commands,
+        ...(request.fetch === undefined ? {} : { fetch: request.fetch }),
+      },
+    );
+  } catch {
+    return false;
+  }
+}
+
+function fastDeploySummary(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+  state: PersistedRuntimeState,
+  impact: PreparedImpact,
+  verificationMode: "affected" | "none",
+  selectedTests: readonly string[],
+  tests: Record<string, { passed: boolean; code: number }>,
+): RunSummary {
+  const services = state.services ?? {};
+  const builds = Object.fromEntries(Object.entries(state.builds ?? {}).map(([name, build]) => [
+    name,
+    { ...build, cache_hit: true },
+  ]));
+  return {
+    action: "deploy",
+    status: "succeeded",
+    project: {
+      name: request.manifest.project.name,
+      logical_id: request.manifest.project.id ?? request.manifest.project.name,
+      runtime_id: supervisor.projectId,
+    },
+    topology: "hybrid",
+    fast_path: selectedTests.length === 0 ? "graph-cache-hit" : "tests-only",
+    ministack: state.ministack ?? {},
+    endpoints: {
+      aws: state.ministack?.host_endpoint,
+      terraform: state.terraform?.outputs ?? {},
+      services: Object.fromEntries(Object.entries(services).map(([name, service]) => [name, {
+        ports: Object.fromEntries(Object.entries(service.ports).map(([containerPort, hostPort]) => [
+          containerPort,
+          { host: "127.0.0.1", host_port: hostPort, address: `127.0.0.1:${hostPort}` },
+        ])),
+      }])),
+    },
+    clones: state.clones ?? {},
+    builds,
+    terraform_changes: { create: 0, update: 0, delete: 0, replace: 0, noOp: 0 },
+    terraform_reconciliation: {
+      skipped: true,
+      reconciled: false,
+      reason: "impact_graph_cache_hit",
+      roots: (state.terraform?.reconciliation?.roots ?? []).map((root) => ({
+        root: root.root,
+        root_index: root.index,
+        skipped: true,
+        reconciled: false,
+        reason: "impact_graph_cache_hit",
+      })),
+    },
+    lambda_clone_bindings: { inspected: 0, updated: 0, skipped: true },
+    adapters: {},
+    services: Object.keys(services),
+    tests,
+    impact: impactPlanDocument(impact.plan),
+    verification: {
+      mode: verificationMode,
+      selected_tests: [...selectedTests],
+    },
+  };
+}
+
+function persistedBuilds(builds: Readonly<Record<string, BuildResult>>): NonNullable<PersistedRuntimeState["builds"]> {
+  return Object.fromEntries(Object.entries(builds).map(([name, result]) => [name, {
+    cache_hit: result.cacheHit,
+    fingerprint: result.fingerprint,
+    ...(result.image === undefined ? {} : { image: result.image }),
+  }]));
+}
+
+async function applyImpactRemovals(
+  impact: PreparedImpact,
+  projectId: string,
+  commands: CommandExecutor,
+  signal: AbortSignal,
+): Promise<void> {
+  const removedAdapters = impact.plan.removalOrder.filter(
+    (id) => impact.plan.removed.get(id)?.kind === "adapter",
+  );
+  if (removedAdapters.length > 0) {
+    throw new AnboError(`adapter removal requires lifecycle cleanup: ${removedAdapters.join(", ")}`, {
+      exitCode: ExitCode.Configuration,
+      code: "ANBO_ADAPTER_REMOVAL_REQUIRES_DOWN",
+      details: {
+        phase: "impact",
+        remediation: "Restore the adapter declaration, run anbo down --target ministack, then remove it and deploy again.",
+        retryable: false,
+        safe_to_retry: true,
+        evidence: { adapters: removedAdapters },
+      },
+    });
+  }
+  for (const id of impact.plan.removalOrder) {
+    const removed = impact.plan.removed.get(id);
+    if (removed?.kind === "service") {
+      await stopDeclaredService(projectId, id.slice("service:".length), commands, signal);
+    }
+  }
+  await recordImpactResults(impact, impact.plan.removalOrder.map((id) => ({
+    id,
+    status: "removed" as const,
+  })));
+}
+
+async function assertNoUnreleasedAdapterRemoval(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+): Promise<void> {
+  const current = new Set(Object.keys(request.manifest.adapters));
+  const state = await supervisor.readState<PersistedRuntimeState>();
+  const previous = new Set(state?.adapters ?? []);
+  if (state?.adapters === undefined) {
+    const ledger = await readImpactLedger(join(supervisor.stateDirectory, "impact-v1.json"));
+    if (ledger.status === "loaded") {
+      for (const node of Object.values(ledger.ledger.nodes)) {
+        if (node.kind === "adapter" && node.id.startsWith("adapter:")) {
+          previous.add(node.id.slice("adapter:".length));
+        }
+      }
+    }
+  }
+  const removed = [...previous].filter((name) => !current.has(name)).sort();
+  if (removed.length === 0) return;
+  throw new AnboError(`adapter removal requires lifecycle cleanup: ${removed.join(", ")}`, {
+    exitCode: ExitCode.Configuration,
+    code: "ANBO_ADAPTER_REMOVAL_REQUIRES_DOWN",
+    details: {
+      phase: "impact",
+      remediation: "Restore the adapter declaration, run anbo down --target ministack, then remove it and deploy again.",
+      retryable: false,
+      safe_to_retry: true,
+      evidence: { adapters: removed.map((name) => impactNodeId("adapter", name)) },
+    },
+  });
 }
 
 async function applyTerraformRoots(
@@ -615,6 +1147,7 @@ async function applyTerraformRoots(
         skipped: true,
         reconciled: false,
         reason: skipReason,
+        changes: { create: 0, update: 0, delete: 0, replace: 0, noOp: 0 },
       };
       rootDecisions.push(decision);
       await emitTerraformRootDecision(sink, decision);
@@ -663,6 +1196,7 @@ async function applyTerraformRoots(
       skipped: false,
       reconciled: true,
       reason: skipReason,
+      changes: result.changes,
     };
     rootDecisions.push(decision);
     await emitTerraformRootDecision(sink, decision);
@@ -977,6 +1511,7 @@ function terraformRootDecisionSummary(decision: TerraformRootDecision): Record<s
     skipped: decision.skipped,
     reconciled: decision.reconciled,
     reason: decision.reason,
+    changes: decision.changes,
   };
 }
 
@@ -1060,17 +1595,94 @@ async function testExistingSandbox(
     services,
     clones: cloneState?.clones ?? {},
   });
-  const selected = request.args.length === 0 ? [] : [request.args[0]!];
-  reportPhase("test");
-  const testPhase = await sink.startPhase("smoke tests", "smoke");
-  const tests = await runConfiguredTests(request.manifest.tests, selected, context, services, {
-    commands: request.commands ?? defaultCommands,
-    ...configuredTestFeedback(sink),
+  reportPhase("impact");
+  const impactAdapterResponses = await invokeImpactAdapters(request, sink, signal, {
+    selected_test: request.args[0] ?? null,
+    services: Object.keys(services),
   });
-  for (const [name, result] of Object.entries(tests)) {
-    await sink.assertion({ name, passed: result.passed, actual: result.code }, { testId: name });
+  const full = request.action === "verify" || request.flags["all"] === true || request.flags["full"] === true;
+  const explicitTest = request.args[0];
+  if (explicitTest !== undefined && request.manifest.tests[explicitTest] === undefined) {
+    throw new AnboError(`unknown test suite ${explicitTest}`, {
+      exitCode: ExitCode.Configuration,
+      code: "ANBO_TEST_UNKNOWN",
+      details: { remediation: `Choose one of: ${Object.keys(request.manifest.tests).sort().join(", ")}` },
+    });
   }
-  await testPhase.finish("smoke tests passed", { tests: Object.keys(tests) });
+  const refreshedServiceNodeIds = refreshedServices.map((service) => impactNodeId("service", service));
+  const impact = await prepareImpact(request, supervisor, sink, {
+    mode: full ? "full" : undefined,
+    forceNodeIds: [
+      ...(explicitTest === undefined ? [] : [impactNodeId("test", explicitTest)]),
+      ...refreshedServiceNodeIds,
+    ],
+    adapterResponses: { ...adapters, ...impactAdapterResponses },
+    runtimeGeneration: miniStack.runtime_generation,
+  });
+  await recordImpactResults(
+    impact,
+    refreshedServiceNodeIds
+      .filter((id) => impact.plan.items.get(id)?.action === "execute")
+      .map((id) => impactResult(impact, id, "succeeded")),
+  );
+  const refreshedServiceNodes = new Set(refreshedServiceNodeIds);
+  if ((request.action === "verify" || request.flags["affected"] === true) &&
+      impact.plan.executionOrder.some(
+        (id) => impact.graph.nodes.get(id)?.kind !== "test" && !refreshedServiceNodes.has(id),
+      )) {
+    throw new AnboError("deployed infrastructure does not match the current project inputs", {
+      exitCode: ExitCode.Configuration,
+      code: "ANBO_DEPLOY_REQUIRED",
+      details: {
+        phase: "impact",
+        remediation: "Run anbo deploy --target ministack, then retry the selective test or full verification.",
+        retryable: true,
+        safe_to_retry: true,
+        evidence: {
+          changed_nodes: impact.plan.executionOrder.filter(
+            (id) => impact.graph.nodes.get(id)?.kind !== "test" && !refreshedServiceNodes.has(id),
+          ),
+        },
+      },
+    });
+  }
+  const selected = selectStandaloneTests(request, impact);
+  let tests: Record<string, { passed: boolean; code: number }> = {};
+  if (selected.length > 0) {
+    reportPhase("test");
+    const testPhase = await sink.startPhase(full ? "full smoke verification" : "selected smoke tests", "smoke");
+    tests = await runTestsWithImpact(request, selected, context, services, sink, impact);
+    for (const [name, result] of Object.entries(tests)) {
+      await sink.assertion({ name, passed: result.passed, actual: result.code }, { testId: name });
+    }
+    await testPhase.finish("smoke tests passed", { tests: Object.keys(tests), mode: full ? "full" : "selected" });
+  }
+  const attestation = request.action === "verify"
+    ? verificationAttestationFromState(impact, sink.runId, Object.keys(tests), state)
+    : undefined;
+  await supervisor.writeState({
+    ...state,
+    status: "ready",
+    deployment: state.deployment ?? {
+      status: "ready",
+      phase: "complete",
+      completed_at: new Date().toISOString(),
+      run_id: state.last_run_id,
+    },
+    verification: {
+      status: "passed",
+      mode: request.action === "verify" ? "full" : "affected",
+      run_id: sink.runId,
+      completed_at: new Date().toISOString(),
+      tests,
+      ...(attestation === undefined ? {} : { attestation }),
+    },
+    last_operation: { action: request.action, status: "succeeded", phase: selected.length === 0 ? "impact" : "test" },
+    last_run_id: sink.runId,
+    last_failure: undefined,
+    services,
+    clones: cloneState?.clones ?? {},
+  });
   return {
     action: "test",
     status: "succeeded",
@@ -1079,7 +1691,401 @@ async function testExistingSandbox(
     adapters: safeAdapterSummary(adapters),
     refreshed_services: refreshedServices,
     tests,
+    selected_tests: selected,
+    impact: impactPlanDocument(impact.plan),
+    ...(attestation === undefined ? {} : { attestation }),
   };
+}
+
+async function verifySandbox(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+  sink: PluginEventSink,
+  signal: AbortSignal,
+  reportPhase: (phase: string) => void,
+): Promise<RunSummary> {
+  const summary = await testExistingSandbox(
+    { ...request, action: "verify", flags: { ...request.flags, all: true, full: true } },
+    supervisor,
+    sink,
+    signal,
+    reportPhase,
+  );
+  return { ...summary, action: "verify", verification: "full" };
+}
+
+async function impactSandbox(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+  sink: PluginEventSink,
+  signal: AbortSignal,
+): Promise<RunSummary> {
+  const state = await supervisor.readState<PersistedRuntimeState>();
+  const adapterResponses = await invokeImpactAdapters(request, sink, signal, {
+    deployed: state?.status === "ready",
+  });
+  const impact = await prepareImpact(request, supervisor, sink, {
+    adapterResponses,
+    runtimeGeneration: state?.ministack?.runtime_generation,
+  });
+  const attestation = state?.verification?.attestation;
+  const attestationValidation = state === undefined || attestation === undefined
+    ? undefined
+    : validateVerificationAttestation(attestation, state, impact);
+  return {
+    action: "impact",
+    status: "succeeded",
+    mode: impact.plan.mode,
+    project_id: supervisor.projectId,
+    manifest: request.manifestPath,
+    plan: impactPlanDocument(impact.plan),
+    ledger: {
+      status: impact.ledgerRead.status,
+      issues: impact.ledgerRead.issues,
+      path: impact.path,
+    },
+    previous_verification: state?.verification ?? null,
+    attestation: attestation === undefined
+      ? null
+      : {
+          ...attestation,
+          valid: attestationValidation?.valid === true,
+          ...(attestationValidation?.valid === false
+            ? { invalid_reasons: attestationValidation.reasons }
+            : {}),
+        },
+  };
+}
+
+async function prepareImpact(
+  request: DeployRequest,
+  supervisor: ProjectSupervisor,
+  sink: PluginEventSink,
+  options: {
+    mode?: ImpactPlanMode;
+    forceNodeIds?: readonly string[];
+    adapterResponses?: Readonly<Record<string, AdapterResponse>>;
+    runtimeGeneration?: string;
+  } = {},
+): Promise<PreparedImpact> {
+  const graph = await createProjectImpactGraph({
+    root: request.root,
+    manifest: request.manifest,
+    adapterResponses: options.adapterResponses ?? {},
+    ...(options.runtimeGeneration === undefined ? {} : { runtimeGeneration: options.runtimeGeneration }),
+  });
+  const path = join(supervisor.stateDirectory, "impact-v1.json");
+  const ledgerRead = await readImpactLedger(path);
+  if (ledgerRead.status === "invalid") {
+    await sink.diagnostic({
+      code: "ANBO_IMPACT_LEDGER_INVALID",
+      cause: ledgerRead.issues.join("; "),
+      remediation: "The selective-execution ledger will be rebuilt conservatively from successful phase results.",
+      retryable: false,
+      safe_to_retry: true,
+      phase: "impact",
+      source: "anbo.impact",
+      level: "warn",
+    });
+  }
+  const mode = options.mode ?? (ledgerRead.status === "loaded" ? "affected" : "cold");
+  const plan = planImpact(graph, ledgerRead.ledger, {
+    mode,
+    forceNodeIds: options.forceNodeIds ?? [],
+  });
+  const document = impactPlanDocument(plan);
+  await sink.emit({
+    kind: "progress",
+    phase: "impact",
+    source: "anbo.impact",
+    level: "info",
+    message: plan.summary.execute === 0
+      ? "No project nodes require execution"
+      : `${plan.summary.execute} project nodes require execution`,
+    fields: { plan: document },
+    redacted: true,
+  });
+  return {
+    path,
+    graph,
+    ledger: ledgerRead.ledger,
+    ledgerRead,
+    plan,
+  };
+}
+
+async function recordImpactResults(
+  impact: PreparedImpact,
+  results: readonly ImpactExecutionResult[],
+): Promise<void> {
+  if (results.length === 0) return;
+  const ledger = updateImpactLedger(impact.ledger, impact.graph, results);
+  await writeImpactLedger(impact.path, ledger);
+  impact.ledger = ledger;
+}
+
+function impactResult(
+  impact: PreparedImpact,
+  id: string,
+  status: "succeeded" | "failed" | "dirty",
+): ImpactExecutionResult {
+  const item = impact.plan.items.get(id);
+  if (item === undefined) throw new Error(`impact plan does not contain ${id}`);
+  return {
+    id,
+    status,
+    effectiveFingerprint: item.effectiveFingerprint,
+  };
+}
+
+async function runTestsWithImpact(
+  request: DeployRequest,
+  selected: readonly string[],
+  context: ServiceRuntimeContext,
+  services: Readonly<Record<string, RunningService>>,
+  sink: PluginEventSink,
+  impact: PreparedImpact,
+): Promise<Record<string, { passed: boolean; code: number }>> {
+  return await runConfiguredTests(request.manifest.tests, selected, context, services, {
+    commands: request.commands ?? defaultCommands,
+    ...configuredTestFeedback(sink),
+    onResult: async (name, result) => {
+      await recordImpactResults(
+        impact,
+        [impactResult(impact, impactNodeId("test", name), result.passed ? "succeeded" : "failed")],
+      );
+    },
+  });
+}
+
+function selectDeployTests(
+  request: DeployRequest,
+  plan: ImpactPlan,
+  mode: "affected" | "full" | "none",
+): string[] {
+  if (mode === "none") return [];
+  if (mode === "full") {
+    return plan.executionOrder
+      .filter((id) => plan.items.get(id)?.kind === "test")
+      .map((id) => id.slice("test:".length));
+  }
+  return plan.executionOrder
+    .filter((id) => plan.items.get(id)?.kind === "test")
+    .map((id) => id.slice("test:".length))
+    .filter((name) => {
+      const test = request.manifest.tests[name];
+      return test?.default === true || test?.always_run === true || test?.cache === false;
+    });
+}
+
+function selectStandaloneTests(request: DeployRequest, impact: PreparedImpact): string[] {
+  if (request.action === "verify" || request.flags["all"] === true || request.flags["full"] === true) {
+    return impact.plan.executionOrder
+      .filter((id) => impact.plan.items.get(id)?.kind === "test")
+      .map((id) => id.slice("test:".length));
+  }
+  const explicit = request.args[0];
+  if (explicit !== undefined) {
+    if (request.manifest.tests[explicit] === undefined) {
+      throw new AnboError(`unknown test suite ${explicit}`, {
+        exitCode: ExitCode.Configuration,
+        code: "ANBO_TEST_UNKNOWN",
+        details: { remediation: `Choose one of: ${Object.keys(request.manifest.tests).sort().join(", ")}` },
+      });
+    }
+    return [explicit];
+  }
+  if (request.flags["failed"] === true) {
+    return Object.values(impact.ledger.nodes)
+      .filter((node) => node.kind === "test" && node.status === "failed" && request.manifest.tests[node.id.slice("test:".length)] !== undefined)
+      .map((node) => node.id.slice("test:".length))
+      .sort();
+  }
+  if (request.flags["affected"] === true) {
+    return impact.plan.executionOrder
+      .filter((id) => impact.plan.items.get(id)?.kind === "test")
+      .map((id) => id.slice("test:".length));
+  }
+  return Object.entries(request.manifest.tests)
+    .filter(([, test]) => test.default === true)
+    .map(([name]) => name)
+    .sort();
+}
+
+function deployVerificationMode(request: DeployRequest): "affected" | "full" | "none" {
+  if (request.flags.test === false || request.flags["no-test"] === true) return "none";
+  const value = request.flags["verify"];
+  if (value === undefined) return "affected";
+  if (value === "affected" || value === "full" || value === "none") return value;
+  throw new AnboError(`unsupported verification mode ${String(value)}`, {
+    exitCode: ExitCode.Usage,
+    code: "ANBO_VERIFY_MODE_INVALID",
+    details: { remediation: "Use --verify affected, --verify full, or --verify none." },
+  });
+}
+
+function terraformHasChanges(changes: TerraformChangeSummary): boolean {
+  return changes.create > 0 || changes.update > 0 || changes.delete > 0 || changes.replace > 0;
+}
+
+function verificationAttestation(
+  impact: PreparedImpact,
+  runId: string,
+  tests: readonly string[],
+  miniStack: MiniStackRuntime,
+  terraform: TerraformDeployResult,
+): VerificationAttestation {
+  return createVerificationAttestation(impact, runId, tests, {
+    runtimeGeneration: miniStack.runtimeGeneration,
+    terraformFingerprint: terraform.fingerprint,
+  });
+}
+
+function verificationAttestationFromState(
+  impact: PreparedImpact,
+  runId: string,
+  tests: readonly string[],
+  state: PersistedRuntimeState,
+): VerificationAttestation {
+  return createVerificationAttestation(impact, runId, tests, {
+    runtimeGeneration: state.ministack?.runtime_generation,
+    terraformFingerprint: state.terraform?.reconciliation?.fingerprint,
+  });
+}
+
+function createVerificationAttestation(
+  impact: PreparedImpact,
+  runId: string,
+  tests: readonly string[],
+  runtime: { runtimeGeneration?: string; terraformFingerprint?: string },
+): VerificationAttestation {
+  const completedAt = new Date().toISOString();
+  const body = {
+    schema_version: 1 as const,
+    mode: "full" as const,
+    run_id: runId,
+    completed_at: completedAt,
+    graph_fingerprint: impact.graph.fingerprint,
+    plan_fingerprint: impact.plan.fingerprint,
+    ...(runtime.runtimeGeneration === undefined ? {} : { runtime_generation: runtime.runtimeGeneration }),
+    ...(runtime.terraformFingerprint === undefined ? {} : { terraform_fingerprint: runtime.terraformFingerprint }),
+    tests: [...tests].sort(),
+  };
+  return {
+    ...body,
+    digest: fingerprintValue(body, VERIFICATION_ATTESTATION_DOMAIN),
+  };
+}
+
+const VERIFICATION_ATTESTATION_DOMAIN = "anbo.verification.attestation.v1";
+
+function failedVerificationState(
+  previous: PersistedRuntimeState["verification"],
+  request: DeployRequest,
+  runId: string,
+  failedTestId: string | undefined,
+): NonNullable<PersistedRuntimeState["verification"]> {
+  const mode = request.action === "verify"
+    ? "full"
+    : request.action === "test"
+      ? "affected"
+      : previous?.mode;
+  const failedTests = [...new Set([
+    ...(previous?.failed_tests ?? []),
+    ...(failedTestId === undefined ? [] : [failedTestId]),
+  ])].sort();
+  return {
+    status: "failed",
+    ...(mode === undefined ? {} : { mode }),
+    run_id: runId,
+    ...(previous?.tests === undefined ? {} : { tests: previous.tests }),
+    ...(failedTests.length === 0 ? {} : { failed_tests: failedTests }),
+  };
+}
+
+function validateVerificationAttestation(
+  attestation: VerificationAttestation,
+  state: PersistedRuntimeState,
+  impact: PreparedImpact,
+): { valid: boolean; reasons: string[] } {
+  const reasons = new Set<string>();
+  const verification = state.verification;
+  if (state.status !== "ready" || state.deployment?.status !== "ready") {
+    reasons.add("deployment_not_ready");
+  }
+  if (verification?.status !== "passed" || verification.mode !== "full") {
+    reasons.add("verification_not_passed");
+  }
+  if (verification?.run_id !== attestation.run_id) {
+    reasons.add("verification_run_mismatch");
+  }
+  if (attestation.graph_fingerprint !== impact.graph.fingerprint) {
+    reasons.add("graph_fingerprint_mismatch");
+  }
+
+  const { digest, ...body } = attestation;
+  if (digest !== fingerprintValue(body, VERIFICATION_ATTESTATION_DOMAIN)) {
+    reasons.add("attestation_digest_mismatch");
+  }
+  if (attestation.runtime_generation !== undefined &&
+      attestation.runtime_generation !== state.ministack?.runtime_generation) {
+    reasons.add("runtime_generation_mismatch");
+  }
+  if (attestation.terraform_fingerprint !== undefined &&
+      attestation.terraform_fingerprint !== state.terraform?.reconciliation?.fingerprint) {
+    reasons.add("terraform_fingerprint_mismatch");
+  }
+
+  const expectedTests = [...impact.graph.nodes.values()]
+    .filter((node) => node.kind === "test")
+    .map((node) => node.id.slice("test:".length))
+    .sort();
+  const attestedTests = [...attestation.tests].sort();
+  if (!sameStringArray(attestedTests, expectedTests)) {
+    reasons.add("attested_test_set_mismatch");
+  }
+
+  if (impact.ledgerRead.status !== "loaded") {
+    reasons.add("impact_ledger_unavailable");
+  }
+  if (impact.ledger.graph_fingerprint !== impact.graph.fingerprint) {
+    reasons.add("impact_ledger_graph_mismatch");
+  }
+  for (const test of expectedTests) {
+    const id = impactNodeId("test", test);
+    const ledgerNode = impact.ledger.nodes[id];
+    const planItem = impact.plan.items.get(id);
+    if (verification?.tests?.[test]?.passed !== true || verification.tests[test]?.code !== 0) {
+      reasons.add(`verification_test_not_passed:${test}`);
+    }
+    if (ledgerNode?.status !== "succeeded") {
+      reasons.add(`impact_test_not_succeeded:${test}`);
+    } else if (planItem === undefined || ledgerNode.effective_fingerprint !== planItem.effectiveFingerprint) {
+      reasons.add(`impact_test_fingerprint_mismatch:${test}`);
+    }
+  }
+
+  return { valid: reasons.size === 0, reasons: [...reasons].sort() };
+}
+
+async function invokeImpactAdapters(
+  request: DeployRequest,
+  sink: PluginEventSink,
+  signal: AbortSignal,
+  payload: Record<string, unknown>,
+): Promise<Record<string, AdapterResponse>> {
+  const adapters = Object.fromEntries(
+    Object.entries(request.manifest.adapters)
+      .filter(([, config]) => config.capabilities?.includes("impact.graph.v1") === true),
+  );
+  if (Object.keys(adapters).length === 0) return {};
+  return await invokeAdaptersForAction(
+    { ...request, manifest: { ...request.manifest, adapters } },
+    sink,
+    signal,
+    "impact",
+    payload,
+  );
 }
 
 async function acquireRequestClones(
@@ -1142,10 +2148,15 @@ async function downSandbox(request: DeployRequest, supervisor: ProjectSupervisor
   const purgeLocal = request.flags["purge"] === true;
   await invokeAdaptersForAction(request, sink, signal, "release", {});
   await invokeAdaptersForAction(request, sink, signal, "teardown", {});
+  await forgetReleasedAdapters(supervisor, Object.keys(request.manifest.adapters));
   await stopDeclaredServices(supervisor.projectId, request.commands ?? defaultCommands, signal);
   await removeProjectTerraformWorkers(supervisor.projectId, request.commands ?? defaultCommands, signal);
   // Clone retention is independent from the reusable local MiniStack snapshot.
-  await stopMiniStack(supervisor.projectId, { purge: purgeLocal, commands: request.commands ?? defaultCommands, signal });
+  await stopMiniStack(supervisor.projectId, {
+    purge: purgeLocal,
+    commands: request.commands ?? defaultCommands,
+    signal,
+  });
   if (purgeLocal) await rm(join(supervisor.stateDirectory, "terraform"), { recursive: true, force: true });
   if (purgeClones && (request.manifest.data.postgres?.provider === "anbo-cloud" || request.manifest.data.dynamodb?.provider === "anbo-cloud")) {
     const apiUrl = requiredEnvironment(request.env, "ANBO_API_URL");
@@ -1166,6 +2177,25 @@ async function downSandbox(request: DeployRequest, supervisor: ProjectSupervisor
   return { action: "down", status: "succeeded", local_state_purged: purgeLocal, clone_purge_requested: purgeClones };
 }
 
+async function forgetReleasedAdapters(supervisor: ProjectSupervisor, adapterNames: readonly string[]): Promise<void> {
+  if (adapterNames.length === 0) return;
+  const path = join(supervisor.stateDirectory, "impact-v1.json");
+  const read = await readImpactLedger(path);
+  if (read.status !== "loaded") return;
+  const nodes = { ...read.ledger.nodes };
+  let changed = false;
+  for (const [id, node] of Object.entries(nodes)) {
+    if (node.kind !== "adapter") continue;
+    changed = delete nodes[id] || changed;
+  }
+  if (!changed) return;
+  await writeImpactLedger(path, {
+    schema_version: read.ledger.schema_version,
+    updated_at: new Date().toISOString(),
+    nodes,
+  });
+}
+
 async function acquireAdapters(
   request: DeployRequest,
   sink: PluginEventSink,
@@ -1180,7 +2210,7 @@ async function invokeAdaptersForAction(
   request: DeployRequest,
   sink: PluginEventSink,
   signal: AbortSignal,
-  action: "handshake" | "acquire" | "reset" | "release" | "test" | "teardown",
+  action: "handshake" | "impact" | "acquire" | "reset" | "release" | "test" | "teardown",
   payload: Record<string, unknown>,
 ): Promise<Record<string, AdapterResponse>> {
   const responses: Record<string, AdapterResponse> = {};
@@ -1354,6 +2384,12 @@ async function debugRun(
     (value) => sink.redactor.redactString(value),
     (value) => sink.redactor.registerSecret(value),
   );
+  const resources = await inspectProjectDockerResources(
+    supervisor.projectId,
+    request.commands ?? defaultCommands,
+    signal,
+    (value) => sink.redactor.redactString(value),
+  );
   return {
     action: "debug",
     status: "succeeded",
@@ -1363,9 +2399,31 @@ async function debugRun(
     evidence: {
       ...(failure === undefined ? {} : { phase: failure.phase }),
       containers,
+      networks: resources.networks,
+      volumes: resources.volumes,
     },
     remediation: failure?.remediation ?? "No MiniStack runtime failure is recorded. Inspect the core run events for this run ID.",
   };
+}
+
+async function inspectProjectDockerResources(
+  projectId: string,
+  commands: CommandExecutor,
+  signal: AbortSignal,
+  redact: (value: string) => string,
+): Promise<{ networks: string[]; volumes: string[] }> {
+  const list = async (kind: "network" | "volume"): Promise<string[]> => {
+    const result = await commands.run("docker", [
+      kind, "ls", "-q", "--filter", `label=anbo.dev/project=${projectId}`,
+    ], { signal });
+    if (result.code !== 0) {
+      const detail = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+      throw new Error(`could not inspect project ${kind}s: ${redact(detail)}`);
+    }
+    return result.stdout.split(/\s+/).filter(Boolean).sort();
+  };
+  const [networks, volumes] = await Promise.all([list("network"), list("volume")]);
+  return { networks, volumes };
 }
 
 async function inspectProjectContainers(

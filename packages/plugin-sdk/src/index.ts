@@ -15,6 +15,9 @@ export const TARGET_ACTIONS = [
   "down",
   "capabilities",
   "cache",
+  "impact",
+  "verify",
+  "recover",
 ] as const;
 
 export type TargetActionV1 = (typeof TARGET_ACTIONS)[number];

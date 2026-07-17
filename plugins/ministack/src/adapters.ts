@@ -10,6 +10,7 @@ export const ADAPTER_PROTOCOL_VERSION = 2 as const;
 export type AdapterAction =
   | "handshake"
   | "discover"
+  | "impact"
   | "configure"
   | "acquire"
   | "renew"
@@ -45,6 +46,35 @@ export interface AdapterBinding {
   metadata?: Record<string, unknown>;
 }
 
+export type AdapterImpactNodeKind =
+  | "adapter"
+  | "build"
+  | "terraform"
+  | "clone"
+  | "service"
+  | "test";
+
+/**
+ * Adapter-contributed nodes use the same wire format as the host impact graph.
+ * IDs are globally namespaced as `<kind>:<name>`; adapters should include their
+ * own name in `<name>` when the node is not intentionally shared.
+ */
+export interface AdapterImpactNode {
+  id: string;
+  kind: AdapterImpactNodeKind;
+  fingerprint: `sha256:${string}`;
+  dependencies?: string[];
+  certainty?: "exact" | "unknown";
+  issues?: string[];
+  cacheable?: boolean;
+  always_run?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AdapterImpact {
+  nodes: AdapterImpactNode[];
+}
+
 export interface AdapterResponse {
   schema_version: typeof ADAPTER_PROTOCOL_VERSION;
   adapter: string;
@@ -52,6 +82,7 @@ export interface AdapterResponse {
   bindings: AdapterBinding[];
   diagnostics: AdapterDiagnostic[];
   state?: Record<string, unknown>;
+  impact?: AdapterImpact;
 }
 
 export interface AdapterInvocationOptions {
@@ -180,7 +211,95 @@ function validateAdapterResponse(name: string, value: unknown): AdapterResponse 
       throw new Error(`Adapter ${name} returned an invalid diagnostic`);
     }
   }
+  if (value.impact !== undefined) validateAdapterImpact(name, value.impact);
   return value as unknown as AdapterResponse;
+}
+
+const IMPACT_NODE_KINDS = new Set<AdapterImpactNodeKind>([
+  "adapter",
+  "build",
+  "terraform",
+  "clone",
+  "service",
+  "test",
+]);
+const IMPACT_DEPENDENCY_KINDS = new Set([...IMPACT_NODE_KINDS, "runtime"]);
+const IMPACT_FIELDS = new Set([
+  "id",
+  "kind",
+  "fingerprint",
+  "dependencies",
+  "certainty",
+  "issues",
+  "cacheable",
+  "always_run",
+  "metadata",
+]);
+const IMPACT_DIGEST = /^sha256:[a-f0-9]{64}$/;
+const IMPACT_NODE_ID = /^([a-z]+):([^\s:\0][^\s\0]*)$/;
+
+function validateAdapterImpact(name: string, value: unknown): asserts value is AdapterImpact {
+  if (!isRecord(value) || Object.keys(value).some((key) => key !== "nodes") || !Array.isArray(value.nodes)) {
+    throw new Error(`Adapter ${name} returned invalid impact metadata`);
+  }
+  const ids = new Set<string>();
+  for (const candidate of value.nodes) {
+    if (!isRecord(candidate) || Object.keys(candidate).some((key) => !IMPACT_FIELDS.has(key))) {
+      throw new Error(`Adapter ${name} returned an invalid impact node`);
+    }
+    const kind = candidate.kind;
+    const id = candidate.id;
+    if (typeof id !== "string" || typeof kind !== "string" || !IMPACT_NODE_KINDS.has(kind as AdapterImpactNodeKind)) {
+      throw new Error(`Adapter ${name} returned an impact node with an invalid namespaced id or kind`);
+    }
+    const match = IMPACT_NODE_ID.exec(id);
+    if (match === null || match[1] !== kind) {
+      throw new Error(`Adapter ${name} returned an impact node with an invalid namespaced id or kind`);
+    }
+    if (ids.has(id)) throw new Error(`Adapter ${name} returned duplicate impact node ${id}`);
+    ids.add(id);
+    if (typeof candidate.fingerprint !== "string" || !IMPACT_DIGEST.test(candidate.fingerprint)) {
+      throw new Error(`Adapter ${name} returned impact node ${id} with an invalid sha256 fingerprint`);
+    }
+    if (candidate.certainty !== undefined && candidate.certainty !== "exact" && candidate.certainty !== "unknown") {
+      throw new Error(`Adapter ${name} returned impact node ${id} with invalid certainty`);
+    }
+    if (candidate.dependencies !== undefined) {
+      validateImpactReferences(name, id, candidate.dependencies);
+    }
+    if (candidate.issues !== undefined && !nonEmptyStringArray(candidate.issues)) {
+      throw new Error(`Adapter ${name} returned impact node ${id} with invalid issues`);
+    }
+    if (candidate.certainty === "unknown"
+      && (candidate.issues === undefined || (candidate.issues as unknown[]).length === 0)) {
+      throw new Error(`Adapter ${name} returned impact node ${id} without an issue explaining unknown certainty`);
+    }
+    if (candidate.cacheable !== undefined && typeof candidate.cacheable !== "boolean") {
+      throw new Error(`Adapter ${name} returned impact node ${id} with invalid cacheable metadata`);
+    }
+    if (candidate.always_run !== undefined && typeof candidate.always_run !== "boolean") {
+      throw new Error(`Adapter ${name} returned impact node ${id} with invalid always_run metadata`);
+    }
+    if (candidate.metadata !== undefined && !isRecord(candidate.metadata)) {
+      throw new Error(`Adapter ${name} returned impact node ${id} with invalid metadata`);
+    }
+  }
+}
+
+function validateImpactReferences(name: string, nodeId: string, value: unknown): asserts value is string[] {
+  if (!stringArray(value) || new Set(value).size !== value.length) {
+    throw new Error(`Adapter ${name} returned impact node ${nodeId} with invalid dependencies`);
+  }
+  for (const dependency of value) {
+    const match = IMPACT_NODE_ID.exec(dependency);
+    if (match === null || !IMPACT_DEPENDENCY_KINDS.has(match[1]!)) {
+      throw new Error(`Adapter ${name} returned impact node ${nodeId} with invalid dependency ${dependency}`);
+    }
+  }
+}
+
+function nonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0);
 }
 
 function stringArray(value: unknown): value is string[] {

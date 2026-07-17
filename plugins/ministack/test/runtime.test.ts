@@ -189,7 +189,7 @@ class IncrementalDeployExecutor implements CommandExecutor {
       Id: this.containerId,
       Config: {
         Image: this.image,
-        Env: ["LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway"],
+        Env: [`LAMBDA_DOCKER_FLAGS=${managedLambdaFlags(this.runtimeNetwork)}`],
         Labels: { "anbo.dev/runtime-config": this.configLabel },
       },
       State: { Running: this.containerRunning, ExitCode: 0, StartedAt: this.runtimeGeneration },
@@ -261,12 +261,16 @@ test("MiniStack separates the egress runtime network from the internal Terraform
 
   const run = executor.calls.find((call) => call.args[0] === "run");
   assert.ok(run?.args.includes("anbo-checkout-runtime"));
+  assert.ok(run?.args.includes("ministack"));
   assert.ok(run?.args.includes("DOCKER_NETWORK=anbo-checkout-runtime"));
   assert.ok(run?.args.includes("host.docker.internal:host-gateway"));
-  assert.ok(run?.args.includes("LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway"));
+  assert.ok(run?.args.includes(`LAMBDA_DOCKER_FLAGS=${managedLambdaFlags()}`));
+  assert.equal(run?.args.some((argument) => argument.startsWith("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT=")), false);
+  assert.equal(run?.args.some((argument) => argument.endsWith(":/var/task")), false);
   assert.ok(executor.calls.some((call) => call.args.join(" ") === "network connect anbo-checkout-control anbo-checkout-ministack"));
   assert.equal(runtime.networkName, "anbo-checkout-control");
   assert.equal(runtime.runtimeNetworkName, "anbo-checkout-runtime");
+  assert.equal(runtime.lambdaEndpoint, "http://ministack:4566");
 });
 
 test("MiniStack reuses only an exact deterministic create-time configuration", async () => {
@@ -302,7 +306,7 @@ test("MiniStack reuses only an exact deterministic create-time configuration", a
     Id: "existing-container-id",
     Config: {
       Image: image,
-      Env: ["LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway"],
+      Env: [`LAMBDA_DOCKER_FLAGS=${managedLambdaFlags("anbo-checkout-reuse-runtime")}`],
       Labels: { [configLabelName!]: configLabelValue! },
     },
     State: { Running: true, ExitCode: 0, StartedAt: "generation-1" },
@@ -2187,6 +2191,104 @@ test("capabilities runs through the target runtime", async () => {
   assert.equal((result["capabilities"] as Record<string, unknown>)["schema_version"], 1);
 });
 
+test("adapter removal is rejected before any runtime or replacement adapter mutation", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-adapter-removal-preflight-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateHome = join(directory, "state");
+  const projectId = "adapter-removal-runtime";
+  const manifest = minimalManifest();
+  const supervisor = new ProjectSupervisor({
+    projectRoot: directory,
+    projectId,
+    logicalProjectId: manifest.project.name,
+    projectName: manifest.project.name,
+    stateHome,
+  });
+  await supervisor.writeState({
+    status: "ready",
+    adapters: ["old-payments"],
+  });
+  const executor = new RecordingExecutor(async () => {
+    throw new Error("preflight must not execute Docker, Terraform, or an adapter");
+  });
+
+  await assert.rejects(runDeploy({
+    root: directory,
+    runtimeProjectId: projectId,
+    manifestPath: join(directory, ".anbo", "sandbox.json"),
+    manifest,
+    action: "deploy",
+    args: [],
+    flags: {},
+    env: {},
+    stateHome,
+    cacheHome: join(directory, "cache"),
+    commands: executor,
+  }, eventSink()), (error: unknown) => {
+    assert.ok(error instanceof AnboError);
+    assert.equal(error.code, "ANBO_ADAPTER_REMOVAL_REQUIRES_DOWN");
+    assert.match(error.details?.remediation as string, /Restore the adapter declaration.*anbo down/s);
+    return true;
+  });
+  assert.deepEqual(executor.calls, []);
+});
+
+test("adapter removal preflight recognizes standalone adapters in legacy ledger state", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-legacy-adapter-removal-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateHome = join(directory, "state");
+  const projectId = "legacy-adapter-removal";
+  const manifest = minimalManifest();
+  manifest.services = {};
+  const supervisor = new ProjectSupervisor({
+    projectRoot: directory,
+    projectId,
+    logicalProjectId: manifest.project.name,
+    projectName: manifest.project.name,
+    stateHome,
+  });
+  await supervisor.writeState({ status: "ready" });
+  const updatedAt = new Date().toISOString();
+  const digest = `sha256:${"a".repeat(64)}`;
+  await writeFile(join(supervisor.stateDirectory, "impact-v1.json"), `${JSON.stringify({
+    schema_version: 1,
+    graph_fingerprint: digest,
+    updated_at: updatedAt,
+    nodes: {
+      "adapter:legacy-payments": {
+        id: "adapter:legacy-payments",
+        kind: "adapter",
+        fingerprint: digest,
+        effective_fingerprint: digest,
+        output_fingerprint: digest,
+        certainty: "exact",
+        status: "succeeded",
+        dependencies: [],
+        updated_at: updatedAt,
+      },
+    },
+  })}\n`);
+  const executor = new RecordingExecutor(async () => {
+    throw new Error("legacy adapter preflight must run before mutation");
+  });
+
+  await assert.rejects(runDeploy({
+    root: directory,
+    runtimeProjectId: projectId,
+    manifestPath: join(directory, ".anbo", "sandbox.json"),
+    manifest,
+    action: "deploy",
+    args: [],
+    flags: {},
+    env: {},
+    stateHome,
+    cacheHome: join(directory, "cache"),
+    commands: executor,
+  }, eventSink()), (error: unknown) =>
+    error instanceof AnboError && error.code === "ANBO_ADAPTER_REMOVAL_REQUIRES_DOWN");
+  assert.deepEqual(executor.calls, []);
+});
+
 test("debug inspects stopped project containers before a deploy reaches ready state", async () => {
   const directory = await mkdtemp(join(tmpdir(), "anbo-failed-debug-test-"));
   const stateHome = join(directory, "state");
@@ -2340,4 +2442,13 @@ function basicMiniStackInspection(containerId: string, generation: string, hostP
       PortBindings: { "4566/tcp": [{ HostIp: "127.0.0.1", HostPort: hostPort }] },
     },
   }]);
+}
+
+function managedLambdaFlags(runtimeNetwork = "anbo-checkout-runtime"): string {
+  return [
+    "--add-host host.docker.internal:host-gateway",
+    "--env AWS_ENDPOINT_URL=http://ministack:4566",
+    "--env ANBO_MINISTACK_ENDPOINT=http://ministack:4566",
+    `--network ${runtimeNetwork}`,
+  ].join(" ");
 }

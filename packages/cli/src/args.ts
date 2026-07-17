@@ -132,11 +132,14 @@ function parseOutput(value: string): OutputMode {
 }
 
 function expectsValue(name: string): boolean {
-  return new Set(["target", "root", "output"]).has(name);
+  return new Set(["target", "root", "output", "verify"]).has(name);
 }
 
 function isBooleanFlag(name: string): boolean {
-  return new Set(["dry-run", "follow", "force", "purge", "reconcile", "refresh", "test", "wait", "yes"]).has(name);
+  return new Set([
+    "affected", "all", "dry-run", "failed", "follow", "force", "full", "purge",
+    "reconcile", "refresh", "stale", "test", "wait", "yes",
+  ]).has(name);
 }
 
 function addFlag(

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
@@ -18,6 +19,9 @@ import { join, resolve } from "node:path";
 import { REDACTED, Redactor } from "./redaction.js";
 
 const STATE_SCHEMA_VERSION = 1 as const;
+const LOCK_SCHEMA_VERSION = 2 as const;
+const CURRENT_PROCESS_START_TIME = `node:${Math.floor((Date.now() - process.uptime() * 1_000) / 1_000)}`;
+const OBSERVATIONAL_OPERATION_KINDS = new Set(["status", "logs", "debug", "capabilities", "impact"]);
 const SECRET_KEY = /(?:^|[_-])(?:authorization|cookie|credentials?|database_url|dsn|password|passwd|private_key|secret(?:_access_key)?|session_token|token)$/i;
 const SECRET_VALUES = [
   /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,
@@ -28,14 +32,24 @@ const SECRET_VALUES = [
 const AWS_RESOURCE_ARN = /^arn:(?:aws|aws-cn|aws-us-gov):[a-z0-9-]+:[a-z0-9-]*:\d{0,12}:.+$/i;
 
 export interface LockMetadata {
-  schema_version: 1;
+  schema_version: 1 | 2;
   operation_id: string;
   kind: string;
   pid: number;
   project_root: string;
   created_at: string;
   heartbeat_at: string;
+  process_start_time?: string;
+  lease_expires_at?: string;
 }
+
+interface ProcessInspection {
+  alive: boolean;
+  zombie: boolean;
+  processStartTime?: string;
+}
+
+type ProcessInspector = (pid: number) => Promise<ProcessInspection>;
 
 export interface FileOperationLockOptions {
   operationId: string;
@@ -43,6 +57,8 @@ export interface FileOperationLockOptions {
   projectRoot: string;
   staleLockMs?: number;
   heartbeatMs?: number;
+  /** Test seam for deterministic dead, zombie, and PID-reuse coverage. */
+  inspectProcess?: ProcessInspector;
 }
 
 export class OperationLockedError extends Error {
@@ -59,7 +75,7 @@ export class OperationLockedError extends Error {
   }
 }
 
-function isProcessAlive(pid: number): boolean {
+function processExists(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -69,17 +85,75 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+async function inspectWithPs(pid: number): Promise<ProcessInspection | undefined> {
+  if (process.platform === "win32") return undefined;
+  try {
+    const stdout = await new Promise<string>((resolveOutput, rejectOutput) => {
+      execFile(
+        "/bin/ps",
+        ["-o", "stat=", "-o", "lstart=", "-p", String(pid)],
+        { encoding: "utf8", maxBuffer: 16 * 1024 },
+        (error, output) => {
+          if (error) rejectOutput(error);
+          else resolveOutput(output);
+        },
+      );
+    });
+    const match = /^\s*(\S+)\s+(.+?)\s*$/.exec(stdout);
+    if (match === null) return { alive: false, zombie: false };
+    return {
+      alive: true,
+      zombie: match[1]!.includes("Z"),
+      processStartTime: `ps:${match[2]!.replace(/\s+/g, " ")}`,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function inspectProcess(pid: number): Promise<ProcessInspection> {
+  if (!processExists(pid)) return { alive: false, zombie: false };
+
+  if (process.platform === "linux") {
+    try {
+      const value = await readFile(`/proc/${pid}/stat`, "utf8");
+      const fields = value.slice(value.lastIndexOf(")") + 1).trim().split(/\s+/);
+      const state = fields[0];
+      const startTime = fields[19];
+      if (state !== undefined && startTime !== undefined) {
+        return {
+          alive: true,
+          zombie: state === "Z",
+          processStartTime: `proc:${startTime}`,
+        };
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { alive: false, zombie: false };
+    }
+  }
+
+  const inspected = await inspectWithPs(pid);
+  if (inspected !== undefined) return inspected;
+  return {
+    alive: processExists(pid),
+    zombie: false,
+    ...(pid === process.pid ? { processStartTime: CURRENT_PROCESS_START_TIME } : {}),
+  };
+}
+
 function parseLock(value: string): LockMetadata | undefined {
   try {
     const parsed = JSON.parse(value) as Partial<LockMetadata>;
     if (
-      parsed.schema_version === 1 &&
+      (parsed.schema_version === 1 || parsed.schema_version === 2) &&
       typeof parsed.operation_id === "string" &&
       typeof parsed.kind === "string" &&
       typeof parsed.pid === "number" &&
       typeof parsed.project_root === "string" &&
       typeof parsed.created_at === "string" &&
-      typeof parsed.heartbeat_at === "string"
+      typeof parsed.heartbeat_at === "string" &&
+      (parsed.process_start_time === undefined || typeof parsed.process_start_time === "string") &&
+      (parsed.lease_expires_at === undefined || typeof parsed.lease_expires_at === "string")
     ) {
       return parsed as LockMetadata;
     }
@@ -96,6 +170,36 @@ async function writeHandle(handle: FileHandle, value: string): Promise<void> {
   await handle.sync();
 }
 
+function lockLeaseExpired(owner: LockMetadata | undefined, mtimeMs: number, staleLockMs: number): boolean {
+  const explicitExpiry = owner?.lease_expires_at === undefined
+    ? Number.NaN
+    : Date.parse(owner.lease_expires_at);
+  if (Number.isFinite(explicitExpiry)) return Date.now() >= explicitExpiry;
+  const heartbeat = owner === undefined ? Number.NaN : Date.parse(owner.heartbeat_at);
+  const refreshedAt = Number.isFinite(heartbeat) ? Math.max(heartbeat, mtimeMs) : mtimeMs;
+  return Date.now() - refreshedAt >= staleLockMs;
+}
+
+async function lockIsStale(
+  owner: LockMetadata | undefined,
+  mtimeMs: number,
+  staleLockMs: number,
+  processInspector: ProcessInspector,
+): Promise<boolean> {
+  const leaseExpired = lockLeaseExpired(owner, mtimeMs, staleLockMs);
+  if (owner === undefined) return leaseExpired;
+
+  const processState = await processInspector(owner.pid);
+  if (!processState.alive || processState.zombie) return true;
+  if (
+    owner.process_start_time !== undefined &&
+    processState.processStartTime !== undefined
+  ) {
+    return owner.process_start_time !== processState.processStartTime;
+  }
+  return leaseExpired;
+}
+
 export class FileOperationLock {
   private heartbeat?: NodeJS.Timeout;
   private heartbeatWrites: Promise<void> = Promise.resolve();
@@ -106,9 +210,12 @@ export class FileOperationLock {
     readonly metadata: LockMetadata,
     private readonly handle: FileHandle,
     heartbeatMs: number,
+    private readonly leaseMs: number,
   ) {
     this.heartbeat = setInterval(() => {
-      this.metadata.heartbeat_at = new Date().toISOString();
+      const now = Date.now();
+      this.metadata.heartbeat_at = new Date(now).toISOString();
+      this.metadata.lease_expires_at = new Date(now + this.leaseMs).toISOString();
       this.heartbeatWrites = this.heartbeatWrites
         .then(() => writeHandle(this.handle, `${JSON.stringify(this.metadata)}\n`))
         .catch(() => undefined);
@@ -119,41 +226,45 @@ export class FileOperationLock {
   static async acquire(path: string, options: FileOperationLockOptions): Promise<FileOperationLock> {
     const staleLockMs = Math.max(250, options.staleLockMs ?? 60_000);
     const heartbeatMs = Math.max(100, options.heartbeatMs ?? Math.min(5_000, staleLockMs / 3));
+    const processInspector = options.inspectProcess ?? inspectProcess;
     await mkdir(resolve(path, ".."), { recursive: true, mode: 0o700 });
 
     for (let attempt = 0; attempt < 4; attempt += 1) {
       let handle: FileHandle | undefined;
       try {
         handle = await open(path, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR, 0o600);
-        const now = new Date().toISOString();
+        const nowMs = Date.now();
+        const now = new Date(nowMs).toISOString();
+        const currentProcess = await processInspector(process.pid);
         const metadata: LockMetadata = {
-          schema_version: 1,
+          schema_version: LOCK_SCHEMA_VERSION,
           operation_id: options.operationId,
           kind: options.kind,
           pid: process.pid,
           project_root: options.projectRoot,
           created_at: now,
           heartbeat_at: now,
+          process_start_time: currentProcess.processStartTime ?? CURRENT_PROCESS_START_TIME,
+          lease_expires_at: new Date(nowMs + staleLockMs).toISOString(),
         };
         await writeHandle(handle, `${JSON.stringify(metadata)}\n`);
-        return new FileOperationLock(path, metadata, handle, heartbeatMs);
+        return new FileOperationLock(path, metadata, handle, heartbeatMs, staleLockMs);
       } catch (error) {
         await handle?.close().catch(() => undefined);
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 
         let owner: LockMetadata | undefined;
-        let age = Number.POSITIVE_INFINITY;
+        let mtimeMs = 0;
         try {
           const [contents, details] = await Promise.all([readFile(path, "utf8"), stat(path)]);
           owner = parseLock(contents);
-          const heartbeat = owner ? Date.parse(owner.heartbeat_at) : Number.NaN;
-          age = Date.now() - (Number.isFinite(heartbeat) ? Math.max(heartbeat, details.mtimeMs) : details.mtimeMs);
+          mtimeMs = details.mtimeMs;
         } catch (readError) {
           if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue;
           throw readError;
         }
 
-        const stale = age >= staleLockMs && (!owner || !isProcessAlive(owner.pid));
+        const stale = await lockIsStale(owner, mtimeMs, staleLockMs, processInspector);
         if (!stale) throw new OperationLockedError(path, owner);
         const stalePath = `${path}.stale.${randomUUID()}`;
         try {
@@ -175,7 +286,13 @@ export class FileOperationLock {
     await this.handle.close().catch(() => undefined);
     try {
       const current = parseLock(await readFile(this.path, "utf8"));
-      if (current?.operation_id === this.metadata.operation_id) await unlink(this.path);
+      if (
+        current?.operation_id === this.metadata.operation_id &&
+        current.pid === this.metadata.pid &&
+        current.process_start_time === this.metadata.process_start_time
+      ) {
+        await unlink(this.path);
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -269,6 +386,7 @@ export interface RunOperationOptions {
   operationId?: string;
   kind: string;
   signal?: AbortSignal;
+  lockMode?: "exclusive" | "observational";
 }
 
 export interface ProjectSupervisorOptions {
@@ -393,38 +511,46 @@ export class ProjectSupervisor {
   async runOperation<T>(options: RunOperationOptions, handler: (context: OperationContext) => Promise<T>): Promise<T> {
     await this.initialize();
     const operationId = safeIdentifier(options.operationId ?? `op_${randomUUID()}`, "operation id");
-    const lock = await FileOperationLock.acquire(this.lockPath, {
-      operationId,
-      kind: options.kind,
-      projectRoot: this.projectRoot,
-      ...(this.staleLockMs === undefined ? {} : { staleLockMs: this.staleLockMs }),
-      ...(this.heartbeatMs === undefined ? {} : { heartbeatMs: this.heartbeatMs }),
-    });
+    const lockMode = options.lockMode ??
+      (OBSERVATIONAL_OPERATION_KINDS.has(options.kind) ? "observational" : "exclusive");
+    const lock = lockMode === "exclusive"
+      ? await FileOperationLock.acquire(this.lockPath, {
+        operationId,
+        kind: options.kind,
+        projectRoot: this.projectRoot,
+        ...(this.staleLockMs === undefined ? {} : { staleLockMs: this.staleLockMs }),
+        ...(this.heartbeatMs === undefined ? {} : { heartbeatMs: this.heartbeatMs }),
+      })
+      : undefined;
     const controller = new AbortController();
     this.controllers.set(operationId, controller);
     const forwardAbort = () => controller.abort(options.signal?.reason);
     options.signal?.addEventListener("abort", forwardAbort, { once: true });
     if (options.signal?.aborted) forwardAbort();
     const cancellationPath = this.cancellationPath(operationId);
-    const cancellationPoll = setInterval(() => {
-      void access(cancellationPath).then(
-        () => controller.abort(new Error(`Operation ${operationId} was cancelled`)),
-        () => undefined,
-      );
-    }, 200);
-    cancellationPoll.unref();
+    const cancellationPoll = lockMode === "exclusive"
+      ? setInterval(() => {
+        void access(cancellationPath).then(
+          () => controller.abort(new Error(`Operation ${operationId} was cancelled`)),
+          () => undefined,
+        );
+      }, 200)
+      : undefined;
+    cancellationPoll?.unref();
 
     try {
-      const previous = await this.readState();
-      await this.writeState({
-        ...(previous ?? {}),
-        active_operation: {
-          operation_id: operationId,
-          kind: options.kind,
-          pid: process.pid,
-          started_at: new Date().toISOString(),
-        },
-      });
+      if (lockMode === "exclusive") {
+        const previous = await this.readState();
+        await this.writeState({
+          ...(previous ?? {}),
+          active_operation: {
+            operation_id: operationId,
+            kind: options.kind,
+            pid: process.pid,
+            started_at: new Date().toISOString(),
+          },
+        });
+      }
       return await handler({
         operationId,
         kind: options.kind,
@@ -439,18 +565,20 @@ export class ProjectSupervisor {
         },
       });
     } finally {
-      clearInterval(cancellationPoll);
+      if (cancellationPoll !== undefined) clearInterval(cancellationPoll);
       options.signal?.removeEventListener("abort", forwardAbort);
       this.controllers.delete(operationId);
       await unlink(cancellationPath).catch(() => undefined);
       try {
-        const current = await this.readState();
-        if (current?.active_operation?.operation_id === operationId) {
-          const { active_operation: _active, ...rest } = current;
-          await this.writeState(rest);
+        if (lockMode === "exclusive") {
+          const current = await this.readState();
+          if (current?.active_operation?.operation_id === operationId) {
+            const { active_operation: _active, ...rest } = current;
+            await this.writeState(rest);
+          }
         }
       } finally {
-        await lock.release();
+        await lock?.release();
       }
     }
   }

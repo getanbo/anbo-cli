@@ -36,7 +36,7 @@ export const descriptor: PluginDescriptorV1 = {
   engines: { anbo: ">=0.2.0 <0.3.0", node: ">=22.0.0" },
   kinds: ["target"],
   targets: ["ministack"],
-  actions: ["configure", "deploy", "status", "test", "logs", "debug", "run", "reset", "down", "capabilities", "cache"],
+  actions: ["configure", "deploy", "status", "test", "logs", "debug", "run", "reset", "down", "capabilities", "cache", "impact", "verify", "recover"],
   config: { schema: "./schemas/plugin-config.v1.schema.json", schema_version: 1 },
   capabilities: [
     "terraform.discovery",
@@ -48,6 +48,8 @@ export const descriptor: PluginDescriptorV1 = {
     "smoke.test",
     "structured.logs",
     "adapter.v2",
+    "impact.graph.v1",
+    "verification.attestation.v1",
   ],
 };
 
@@ -172,16 +174,19 @@ class MiniStackTarget implements TargetProviderV1 {
 function unsupportedFlag(action: TargetRequestV1["action"], flags: TargetRequestV1["flags"]): string | undefined {
   const allowed: Readonly<Record<TargetRequestV1["action"], ReadonlySet<string>>> = {
     configure: new Set(["dry-run", "force", "refresh"]),
-    deploy: new Set(["test", "no-test", "reconcile"]),
+    deploy: new Set(["test", "no-test", "reconcile", "verify"]),
     status: new Set(),
-    test: new Set(),
+    test: new Set(["affected", "failed", "all"]),
     logs: new Set(["follow", "service"]),
     debug: new Set(),
     run: new Set(),
-    reset: new Set(["test", "no-test", "reconcile", "fresh-clones"]),
+    reset: new Set(["test", "no-test", "reconcile", "fresh-clones", "verify"]),
     down: new Set(["purge", "purge-clones"]),
     capabilities: new Set(),
     cache: new Set(),
+    impact: new Set(),
+    verify: new Set(["full"]),
+    recover: new Set(["stale"]),
   };
   return Object.keys(flags).sort().find((name) => !allowed[action].has(name));
 }
