@@ -61,7 +61,7 @@
       "type": "array",
       "uniqueItems": true,
       "items": {
-        "enum": ["configure", "deploy", "status", "test", "logs", "debug", "run", "reset", "down", "capabilities", "cache"]
+        "enum": ["configure", "deploy", "status", "test", "logs", "debug", "run", "reset", "down", "capabilities", "cache", "impact", "verify", "recover"]
       }
     }
   }

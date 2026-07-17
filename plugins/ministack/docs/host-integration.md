@@ -8,7 +8,8 @@ and engine ranges, and only then call `activate(context)`.
 The activated runtime registers one target, `ministack`, with these actions:
 
 ```text
-configure deploy status test logs debug down capabilities cache
+configure deploy status test logs debug run reset down capabilities cache
+impact verify recover
 ```
 
 The host owns argument parsing, project and plugin locks, output rendering,

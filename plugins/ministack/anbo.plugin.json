@@ -24,7 +24,10 @@
     "reset",
     "down",
     "capabilities",
-    "cache"
+    "cache",
+    "impact",
+    "verify",
+    "recover"
   ],
   "config": {
     "schema": "./schemas/plugin-config.v1.schema.json",
@@ -39,6 +42,8 @@
     "build.cache",
     "smoke.test",
     "structured.logs",
-    "adapter.v2"
+    "adapter.v2",
+    "impact.graph.v1",
+    "verification.attestation.v1"
   ]
 }

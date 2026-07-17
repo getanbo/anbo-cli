@@ -1,5 +1,6 @@
 .anbo
 .terraform
+acceptance-inputs
 infra
 lambda
 node_modules

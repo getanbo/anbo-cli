@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ import {
   CERTIFIED_MINISTACK_IMAGE,
 } from "../src/distribution.js";
 import { PluginEventSink } from "../src/event-sink.js";
-import { buildDeclaredImages } from "../src/runtime/cache.js";
+import { buildDeclaredImages, fingerprintDeclaredBuild } from "../src/runtime/cache.js";
 import {
   startMiniStack,
   type CommandExecutor,
@@ -85,12 +85,14 @@ for (const serverPlatform of ["linux/amd64", "linux/arm64"] as const) {
       ...(serverPlatform === "linux/arm64" ? ["--label", compatibilityLabel] : []),
       "--label", runtimeConfigLabel,
       "--network", "anbo-platform-selection-runtime",
+      "--network-alias", "ministack",
       "--add-host", "host.docker.internal:host-gateway",
       "--publish", publishedPort,
       "--volume", "/var/run/docker.sock:/var/run/docker.sock",
       "--env", "DOCKER_NETWORK=anbo-platform-selection-runtime",
       "--env", "LAMBDA_EXECUTOR=docker",
-      "--env", "LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway",
+      "--env", "LAMBDA_STRICT=1",
+      "--env", `LAMBDA_DOCKER_FLAGS=${managedLambdaFlags()}`,
       "--env", "MINISTACK_REGION=us-east-1",
       "--env", "MINISTACK_ACCOUNT_ID=000000000000",
       ...(serverPlatform === "linux/arm64" ? ["--env", "OPENSSL_armcap=0"] : []),
@@ -125,6 +127,42 @@ test("ARM64 compatibility probes once and reuses only the exact certified image"
         ? { code: 0, stdout: runningInspection(runArguments), stderr: "" }
         : { code: 1, stdout: "", stderr: "No such container" };
     }
+    if (args[0] === "run" && args.includes("--rm")) {
+      const script = args.at(-1) ?? "";
+      assert.deepEqual(args.slice(0, 12), [
+        "run", "--rm", "--name", "anbo-arm64-certification-ministack-certification",
+        "--platform", "linux/arm64",
+        "--network", "anbo-arm64-certification-runtime",
+        "--env", "OPENSSL_armcap=0",
+        "--entrypoint", "python",
+      ]);
+      assert.match(script, /Ed25519PrivateKey/);
+      assert.match(script, /import asyncssh/);
+      assert.match(script, /generate_data_key/);
+      assert.match(script, /kms\.encrypt/);
+      assert.match(script, /kms\.decrypt/);
+      assert.match(script, /create_function/);
+      assert.match(script, /put_item/);
+      assert.match(script, /send_message/);
+      assert.match(script, /http:\/\/ministack:4566/);
+      assert.match(script, /key_id = None/);
+      assert.match(script, /cleanup_errors = \[\]/);
+      assert.match(script, /get_queue_url\(QueueName=queue_name\)/);
+      assert.match(script, /cleanup_resource\('lambda function'/);
+      assert.match(script, /cleanup_resource\('SQS queue'/);
+      assert.match(script, /cleanup_resource\('DynamoDB table'/);
+      assert.match(script, /cleanup_resource\('KMS key'/);
+      assert.doesNotMatch(script, /(?:table|function)_created/);
+      assert.doesNotMatch(script, /except Exception: pass/);
+      const lifecycleFinally = script.lastIndexOf("finally:");
+      assert.ok(lifecycleFinally >= 0);
+      assert.ok(script.indexOf("kms.schedule_key_deletion", lifecycleFinally) > lifecycleFinally);
+      return {
+        code: 0,
+        stdout: '{"architecture":"aarch64","asyncssh":"2.24.0","ed25519":true,"kms":true,"lambda_reentrant":true}\n',
+        stderr: "",
+      };
+    }
     if (args[0] === "run") {
       created = true;
       runArguments = args;
@@ -134,19 +172,6 @@ test("ARM64 compatibility probes once and reuses only the exact certified image"
       return certified
         ? { code: 0, stdout: `${CERTIFIED_MINISTACK_DIGEST}\n`, stderr: "" }
         : { code: 1, stdout: "", stderr: "No such image" };
-    }
-    if (args[0] === "exec") {
-      const script = args.at(-1) ?? "";
-      assert.match(script, /Ed25519PrivateKey/);
-      assert.match(script, /import asyncssh/);
-      assert.match(script, /generate_data_key/);
-      assert.match(script, /kms\.encrypt/);
-      assert.match(script, /kms\.decrypt/);
-      return {
-        code: 0,
-        stdout: '{"architecture":"aarch64","asyncssh":"2.24.0","ed25519":true,"kms":true}\n',
-        stderr: "",
-      };
     }
     if (args[0] === "image" && args[1] === "tag") {
       certified = true;
@@ -176,7 +201,7 @@ test("ARM64 compatibility probes once and reuses only the exact certified image"
   assert.equal(warm.compatibility?.certificationCacheHit, true);
   assert.equal(warm.reused, true);
   assert.deepEqual(cacheHits, [false, true]);
-  assert.equal(executor.calls.filter((call) => call.args[0] === "exec").length, 1);
+  assert.equal(executor.calls.filter((call) => call.args[0] === "run" && call.args.includes("--rm")).length, 1);
   assert.equal(executor.calls.filter((call) => call.args[0] === "image" && call.args[1] === "tag").length, 1);
 });
 
@@ -191,6 +216,9 @@ test("ARM64 compatibility certification fails clearly and never records a cache 
         ? { code: 0, stdout: runningInspection(runArguments), stderr: "" }
         : { code: 1, stdout: "", stderr: "No such container" };
     }
+    if (args[0] === "run" && args.includes("--rm")) {
+      return { code: 132, stdout: "", stderr: "Illegal instruction" };
+    }
     if (args[0] === "run") {
       created = true;
       runArguments = args;
@@ -199,7 +227,6 @@ test("ARM64 compatibility certification fails clearly and never records a cache 
     if (args[0] === "image" && args[1] === "inspect") {
       return { code: 1, stdout: "", stderr: "No such image" };
     }
-    if (args[0] === "exec") return { code: 132, stdout: "", stderr: "Illegal instruction" };
     return { code: 0, stdout: "", stderr: "" };
   });
 
@@ -213,6 +240,64 @@ test("ARM64 compatibility certification fails clearly and never records a cache 
     commands: executor,
     fetch: async () => Response.json({ edition: "full" }),
   }), /ARM64 compatibility certification failed: Illegal instruction/);
+  assert.equal(executor.calls.some((call) => call.args[0] === "image" && call.args[1] === "tag"), false);
+});
+
+test("ARM64 compatibility preserves probe failure when certification-container cleanup also fails", async () => {
+  let runArguments: readonly string[] = [];
+  let created = false;
+  const probeContainer = "anbo-arm64-primary-failure-ministack-certification";
+  const executor = new TestExecutor(async (args) => {
+    if (args[0] === "version") return { code: 0, stdout: "linux/arm64\n", stderr: "" };
+    if (args[0] === "network" && args[1] === "inspect") return { code: 1, stdout: "", stderr: "No such network" };
+    if (args[0] === "inspect") {
+      return created
+        ? { code: 0, stdout: runningInspection(runArguments), stderr: "" }
+        : { code: 1, stdout: "", stderr: "No such container" };
+    }
+    if (args[0] === "run" && args.includes("--rm")) {
+      return { code: 132, stdout: "", stderr: "Illegal instruction in certification probe" };
+    }
+    if (args[0] === "run") {
+      created = true;
+      runArguments = args;
+      return { code: 0, stdout: "container-id\n", stderr: "" };
+    }
+    if (args[0] === "image" && args[1] === "inspect") {
+      return { code: 1, stdout: "", stderr: "No such image" };
+    }
+    if (args[0] === "rm" && args[1] === "-f" && args[2] === probeContainer) {
+      return { code: 1, stdout: "", stderr: "cleanup permission denied" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  let failure: unknown;
+  try {
+    await startMiniStack({
+      projectId: "arm64-primary-failure",
+      image: CERTIFIED_MINISTACK_IMAGE,
+      digest: CERTIFIED_MINISTACK_DIGEST,
+      persistence: false,
+      stateRoot: "/tmp/unused",
+    }, {
+      commands: executor,
+      fetch: async () => Response.json({ edition: "full" }),
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /ARM64 compatibility certification failed: Illegal instruction in certification probe/);
+  assert.ok(failure.cause instanceof Error);
+  const cleanupFailure = (failure.cause as Error & { cleanupFailure?: unknown }).cleanupFailure;
+  assert.ok(cleanupFailure instanceof Error);
+  assert.match(cleanupFailure.message, /cleanup permission denied/);
+  const cleanupCall = executor.calls.find((call) =>
+    call.args[0] === "rm" && call.args[1] === "-f" && call.args[2] === probeContainer
+  );
+  assert.equal(cleanupCall?.options?.cleanup, true);
   assert.equal(executor.calls.some((call) => call.args[0] === "image" && call.args[1] === "tag"), false);
 });
 
@@ -302,12 +387,18 @@ test("Docker builds safely fall back when the Buildx plugin is unavailable", asy
   const directory = await mkdtemp(join(tmpdir(), "anbo-buildx-fallback-"));
   try {
     await writeFile(join(directory, "Dockerfile"), "FROM scratch\n");
+    let built = false;
     const executor = new TestExecutor(async (args) => {
-      if (args[0] === "image") return { code: 1, stdout: "", stderr: "missing" };
+      if (args[0] === "image") return built
+        ? { code: 0, stdout: "sha256:fallback-image\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "missing" };
       if (args[0] === "buildx" && args[1] === "version") {
         return { code: 1, stdout: "", stderr: "docker: 'buildx' is not a docker command." };
       }
-      if (args[0] === "build") return { code: 0, stdout: "Successfully built image\n", stderr: "" };
+      if (args[0] === "build") {
+        built = true;
+        return { code: 0, stdout: "Successfully built image\n", stderr: "" };
+      }
       return { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` };
     });
 
@@ -384,7 +475,7 @@ test("Docker build fingerprints include symbolic-link targets", async () => {
   }
 });
 
-test("Docker build fingerprints follow .dockerignore without hardcoded directory exclusions", async () => {
+test("Docker build contexts combine safe defaults with project .dockerignore rules", async () => {
   const directory = await mkdtemp(join(tmpdir(), "anbo-build-ignore-"));
   const cacheRoot = await mkdtemp(join(tmpdir(), "anbo-build-ignore-cache-"));
   try {
@@ -394,7 +485,20 @@ test("Docker build fingerprints follow .dockerignore without hardcoded directory
     await writeFile(join(directory, ".dockerignore"), "ignored\n");
     await writeFile(join(directory, "ignored", "noise.txt"), "first\n");
     await writeFile(join(directory, "node_modules", "dependency.js"), "first\n");
-    const executor = buildSuccessExecutor();
+    let preparedContext: string | undefined;
+    const executor = new TestExecutor(async (args) => {
+      if (args[0] === "image" && args[1] === "inspect") return { code: 0, stdout: "image-id\n", stderr: "" };
+      if (args[0] === "buildx" && args[1] === "version") return { code: 0, stdout: "buildx v1\n", stderr: "" };
+      if (args[0] === "buildx" && args[1] === "build") {
+        preparedContext = args.at(-1);
+        assert.ok(preparedContext);
+        assert.notEqual(preparedContext, directory);
+        assert.equal(await readFile(join(preparedContext, "Dockerfile"), "utf8"), "FROM scratch\nCOPY . /context\n");
+        await assert.rejects(readFile(join(preparedContext, "node_modules", "dependency.js")), /ENOENT/);
+        return { code: 0, stdout: "built\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` };
+    });
     const request = {
       projectId: "ignore-fingerprint",
       root: directory,
@@ -406,8 +510,93 @@ test("Docker build fingerprints follow .dockerignore without hardcoded directory
     await writeFile(join(directory, "ignored", "noise.txt"), "second\n");
     assert.equal((await buildDeclaredImages(request, { commands: executor })).api?.cacheHit, true);
     await writeFile(join(directory, "node_modules", "dependency.js"), "second\n");
-    assert.equal((await buildDeclaredImages(request, { commands: executor })).api?.cacheHit, false);
-    assert.equal(dockerBuildCount(executor), 2);
+    const unchanged = await buildDeclaredImages(request, { commands: executor });
+    assert.equal(unchanged.api?.cacheHit, true);
+    assert.deepEqual(unchanged.api?.metadata["context_default_excludes"], ["node_modules"]);
+    assert.equal(unchanged.api?.metadata["context_files"], 2);
+    assert.equal(dockerBuildCount(executor), 1);
+    assert.ok(preparedContext);
+    await assert.rejects(readFile(join(preparedContext, "Dockerfile")), /ENOENT/);
+  } finally {
+    await Promise.all([
+      rm(directory, { recursive: true, force: true }),
+      rm(cacheRoot, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("a managed cache inside the Docker context does not invalidate its own build", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-build-in-context-cache-"));
+  const cacheRoot = join(directory, "cache");
+  try {
+    await writeFile(join(directory, "Dockerfile"), "FROM scratch\nCOPY . /context\n");
+    await writeFile(join(directory, "source.txt"), "source\n");
+    const executor = buildSuccessExecutor();
+    const build = { context: ".", dockerfile: "Dockerfile" };
+    const request = {
+      projectId: "in-context-cache",
+      root: directory,
+      builds: { api: build },
+      cacheRoot,
+    };
+
+    const first = await buildDeclaredImages(request, { commands: executor });
+    assert.equal(first.api?.cacheHit, false);
+    assert.equal(await fingerprintDeclaredBuild(directory, build), first.api?.fingerprint);
+
+    const cacheDirectory = join(cacheRoot, "in-context-cache", "api");
+    await writeFile(join(cacheDirectory, "unrelated-cache-data"), "noise\n");
+    assert.equal(await fingerprintDeclaredBuild(directory, build), first.api?.fingerprint);
+    assert.equal((await buildDeclaredImages(request, { commands: executor })).api?.cacheHit, true);
+    assert.equal(dockerBuildCount(executor), 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("cancelled Docker builds remove partial BuildKit cache and metadata", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-build-cancelled-"));
+  const cacheRoot = await mkdtemp(join(tmpdir(), "anbo-build-cancelled-cache-"));
+  const controller = new AbortController();
+  try {
+    await writeFile(join(directory, "Dockerfile"), "FROM scratch\n");
+    const executor = new TestExecutor(async (args, options) => {
+      if (args[0] === "image" && args[1] === "inspect") {
+        return { code: 1, stdout: "", stderr: "missing" };
+      }
+      if (args[0] === "buildx" && args[1] === "version") {
+        return { code: 0, stdout: "buildx v1\n", stderr: "" };
+      }
+      if (args[0] === "buildx" && args[1] === "build") {
+        assert.equal(options?.signal, controller.signal);
+        const cacheSpec = args[args.indexOf("--cache-to") + 1];
+        const nextCache = cacheSpec?.match(/(?:^|,)dest=([^,]+)/)?.[1];
+        const metadataPath = args[args.indexOf("--metadata-file") + 1];
+        assert.ok(nextCache);
+        assert.ok(metadataPath);
+        await mkdir(nextCache, { recursive: true });
+        await writeFile(join(nextCache, "partial"), "partial\n");
+        await writeFile(metadataPath, "{\"partial\":true}\n");
+        controller.abort(new DOMException("cancelled", "AbortError"));
+        throw controller.signal.reason;
+      }
+      return { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` };
+    });
+
+    await assert.rejects(buildDeclaredImages({
+      projectId: "cancelled",
+      root: directory,
+      builds: { api: { context: ".", dockerfile: "Dockerfile" } },
+      cacheRoot,
+      signal: controller.signal,
+    }, { commands: executor }), (error: unknown) =>
+      error instanceof DOMException && error.name === "AbortError"
+    );
+
+    const entries = await readdir(join(cacheRoot, "cancelled", "api"));
+    assert.equal(entries.some((entry) => entry.startsWith("buildkit-next-")), false);
+    assert.equal(entries.some((entry) => entry.startsWith("metadata-")), false);
+    assert.equal(entries.some((entry) => entry.startsWith("context-")), false);
   } finally {
     await Promise.all([
       rm(directory, { recursive: true, force: true }),
@@ -462,11 +651,64 @@ test("command build outputs invalidate downstream command builds", async () => {
     assert.equal(unchanged.producer?.cacheHit, true);
     assert.equal(unchanged.consumer?.cacheHit, true);
 
+    await writeFile(generated, "tampered\n");
+    const repairedProducer = await buildDeclaredImages(request, { commands: executor });
+    assert.equal(repairedProducer.producer?.cacheHit, false);
+    assert.equal(repairedProducer.consumer?.cacheHit, true);
+    assert.equal(await readFile(generated, "utf8"), "first\n");
+
+    await writeFile(consumed, "tampered\n");
+    const repairedConsumer = await buildDeclaredImages(request, { commands: executor });
+    assert.equal(repairedConsumer.producer?.cacheHit, true);
+    assert.equal(repairedConsumer.consumer?.cacheHit, false);
+    assert.equal(await readFile(consumed, "utf8"), "first\n");
+
     await writeFile(source, "second\n");
     const changed = await buildDeclaredImages(request, { commands: executor });
     assert.equal(changed.producer?.cacheHit, false);
     assert.equal(changed.consumer?.cacheHit, false);
     assert.equal(await readFile(consumed, "utf8"), "second\n");
+  } finally {
+    await Promise.all([
+      rm(directory, { recursive: true, force: true }),
+      rm(cacheRoot, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("Docker build cache rejects a tag whose image identity changed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-docker-identity-"));
+  const cacheRoot = await mkdtemp(join(tmpdir(), "anbo-docker-identity-cache-"));
+  try {
+    await writeFile(join(directory, "Dockerfile"), "FROM scratch\n");
+    let imageId = "sha256:missing";
+    let buildNumber = 0;
+    const executor = new TestExecutor(async (args) => {
+      if (args[0] === "image" && args[1] === "inspect") {
+        return { code: 0, stdout: `${imageId}\n`, stderr: "" };
+      }
+      if (args[0] === "buildx" && args[1] === "version") {
+        return { code: 0, stdout: "buildx v1\n", stderr: "" };
+      }
+      if (args[0] === "buildx" && args[1] === "build") {
+        buildNumber += 1;
+        imageId = `sha256:built-${buildNumber}`;
+        return { code: 0, stdout: "built\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` };
+    });
+    const request = {
+      projectId: "docker-identity",
+      root: directory,
+      builds: { api: { context: ".", dockerfile: "Dockerfile" } },
+      cacheRoot,
+    };
+
+    assert.equal((await buildDeclaredImages(request, { commands: executor })).api?.cacheHit, false);
+    assert.equal((await buildDeclaredImages(request, { commands: executor })).api?.cacheHit, true);
+    imageId = "sha256:retagged";
+    assert.equal((await buildDeclaredImages(request, { commands: executor })).api?.cacheHit, false);
+    assert.equal(buildNumber, 2);
   } finally {
     await Promise.all([
       rm(directory, { recursive: true, force: true }),
@@ -575,7 +817,7 @@ function runningInspection(runArguments: readonly string[]): string {
     Image: CERTIFIED_MINISTACK_DIGEST,
     Config: {
       Image: runArguments.at(-1),
-      Env: ["LAMBDA_DOCKER_FLAGS=--add-host host.docker.internal:host-gateway"],
+      Env: [`LAMBDA_DOCKER_FLAGS=${managedLambdaFlags(runtimeNetwork)}`],
       Labels: { "anbo.dev/runtime-config": runtimeConfig },
     },
     State: { Running: true, ExitCode: 0, StartedAt: "generation-1" },
@@ -585,6 +827,15 @@ function runningInspection(runArguments: readonly string[]): string {
     },
     NetworkSettings: { Networks: { [`anbo-${projectId}-control`]: {}, [runtimeNetwork]: {} } },
   }]);
+}
+
+function managedLambdaFlags(runtimeNetwork = "anbo-platform-selection-runtime"): string {
+  return [
+    "--add-host host.docker.internal:host-gateway",
+    "--env AWS_ENDPOINT_URL=http://ministack:4566",
+    "--env ANBO_MINISTACK_ENDPOINT=http://ministack:4566",
+    `--network ${runtimeNetwork}`,
+  ].join(" ");
 }
 
 function buildSuccessExecutor(): TestExecutor {

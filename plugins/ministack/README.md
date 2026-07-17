@@ -41,11 +41,14 @@ Then use the installed CLI from the project root:
 
 ```bash
 npx anbo configure --target ministack --output jsonl
+npx anbo impact --target ministack --output json
 npx anbo deploy --target ministack --output jsonl
 npx anbo status --target ministack --output jsonl
-npx anbo test --target ministack --output jsonl
+npx anbo test --target ministack --affected --output jsonl
+npx anbo verify --target ministack --full --output jsonl
 npx anbo logs --target ministack --follow --output jsonl
 npx anbo debug --target ministack --output jsonl
+npx anbo recover --target ministack --stale --output jsonl
 npx anbo down --target ministack --purge --output jsonl
 ```
 
@@ -136,9 +139,11 @@ index. Both the selected and reported platforms are recorded in structured
 phase output. On certified ARM64 Docker servers, the plugin injects the pinned
 `OPENSSL_armcap=0` compatibility setting required by MiniStack 1.4.2 under
 virtualized ARM CPUs. It certifies native architecture, Ed25519, AsyncSSH, the
-full health profile, and KMS before returning ready, then reuses a
+full health profile, KMS, strict Docker Lambda execution, and a
+Lambda-to-MiniStack callback before returning ready, then reuses a
 recipe-fingerprinted Docker-local certification tag on warm deploys. AMD64 does
-not receive this setting.
+not receive this setting. Strict mode prevents a broken Docker-in-Docker setup
+from being hidden by MiniStack's local subprocess fallback.
 
 A normal deploy skips a Terraform root only when its owned inputs, saved state
 metadata, filtered outputs, and the exact healthy MiniStack container process
@@ -162,6 +167,23 @@ Smoke tests are declared in `.anbo/sandbox.json` and execute only through
 the plugin promotes assertions and progress into the canonical ordered event
 stream while retaining process output for debugging.
 
+Deploys use a content-fingerprinted dependency graph. An unchanged running
+sandbox skips build, Terraform, service, and test phases when its persisted
+runtime and build artifacts remain valid and no test policy or previous failure
+selects work. A selected or test-only change can skip build, Terraform, and
+service reconciliation when no clone, adapter, or runtime-bound service needs a
+binding refresh; otherwise the existing content-addressed build, per-root
+Terraform, and service reconcilers run. Affected default-policy tests run
+afterward. Preview decisions with `anbo impact`; choose
+`anbo deploy --verify affected|full|none`, focused
+`anbo test --affected|--failed|--all`, or `anbo verify --full` as the confidence
+level requires. Test entries can declare project-relative `inputs`, namespaced
+`requires`, `tags`, `cache`, and `always_run`. Unknown adapter inputs and
+invalid ledger state fall back conservatively rather than creating a false
+cache hit; an unknown required node is a configuration error. The private
+ledger and full-verification attestations live in the plugin's `.anbo/state`
+namespace. See [Selective execution](docs/selective-execution.md).
+
 Failures return one canonical diagnostic with a stable code, exact exit code,
 phase, retryability, remediation, and any safe evidence. `anbo logs` and
 `anbo debug` can inspect labelled containers even when startup never reached a
@@ -182,6 +204,12 @@ Terraform is limited to `hashicorp/aws` in a digest-pinned worker. The plugin
 rejects production AWS credentials, provisioners, external data sources,
 remote-state data sources, host Terraform fallback, and local modules that
 escape the configured root. See [MiniStack support](docs/ministack-support.md).
+
+The pinned upstream MiniStack 1.4.2 runtime removes Docker-backed child
+resources by global `ministack=*` labels during startup and shutdown. Until
+upstream child labels are project-namespaced, do not run multiple Docker-backed
+MiniStack runtimes concurrently on the same Docker daemon. Anbo's own service,
+network, Terraform worker, and build-image labels remain checkout-isolated.
 
 ## Extensions
 

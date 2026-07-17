@@ -446,6 +446,9 @@ Core commands:
   test            Run target smoke or integration tests
   logs            Stream structured target logs
   debug           Collect deterministic diagnostics
+  impact          Explain affected builds, infrastructure, services, and tests
+  verify          Run full verification and issue a local attestation
+  recover         Recover a stale target operation lock
   run             Execute a command in a target service
   reset           Reset and redeploy target state
   down            Stop and remove the target deployment
@@ -458,6 +461,12 @@ Compatibility:
 
 MiniStack deploy options:
   --reconcile              Force a full Terraform refresh
+  --verify affected|full|none
+
+MiniStack test options:
+  --affected               Run tests affected by current project changes
+  --failed                 Retry tests that last failed
+  --all                    Run every configured test
 
 MiniStack configure options:
   --refresh                Merge newly discovered project topology

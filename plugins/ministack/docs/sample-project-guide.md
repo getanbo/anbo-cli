@@ -266,6 +266,16 @@ manifest. Keep the generated MiniStack tag and digest unchanged.
       "command": ["node", "scripts/smoke.mjs"],
       "service": "api",
       "depends_on": ["api"],
+      "inputs": [
+        "src/notes/**",
+        "scripts/smoke.mjs",
+        "package.json",
+        "package-lock.json"
+      ],
+      "requires": ["service:api", "terraform:infra"],
+      "tags": ["smoke", "notes"],
+      "cache": true,
+      "always_run": false,
       "timeout_seconds": 60,
       "default": true,
       "environment": {
@@ -295,6 +305,13 @@ fingerprint matches and the image still exists.
 Omit `host` from a port to let Docker allocate a free loopback port. Read the
 actual address from the terminal deploy summary or `anbo status`; do not assume
 that it is port 8080 on the host.
+
+The test's `inputs` are project-relative files or glob patterns. `requires`
+adds namespaced dependency graph edges; the available prefixes are `runtime:`,
+`build:`, `terraform:`, `clone:`, `adapter:`, `service:`, and `test:`. Split
+independent behavior into separate test entries so Anbo can select it
+independently. See [Selective execution](selective-execution.md) for the full
+field and fallback rules.
 
 ## 7. Write an Agent-Friendly Smoke Test
 
@@ -479,10 +496,31 @@ with a `source` alias and export `ANBO_API_URL` and `ANBO_TOKEN`. See
 
 ## 10. Use the Development Loop
 
-Deploy after source or Terraform changes:
+Preview the affected graph, then deploy after source or Terraform changes:
 
 ```bash
+anbo impact --output json
 anbo deploy --output jsonl
+```
+
+Deploy defaults to `--verify affected`. For cacheable tests that previously
+passed, an eligible warm no-change run reuses test results as well as healthy
+infrastructure. Tests with `always_run: true` or `cache: false`, and previously
+failed default-policy tests, still run. A test-only fast path is available when
+no clone, adapter, or runtime-bound service needs refreshed credentials or
+bindings. Use explicit test selection for focused feedback:
+
+```bash
+anbo test --affected --output jsonl
+anbo test --failed --output jsonl
+anbo test --all --output jsonl
+```
+
+Before a release or real AWS deploy, force the complete test set and record a
+full-verification attestation:
+
+```bash
+anbo verify --full --output jsonl
 ```
 
 Unchanged command builds and Docker images are reused. A normal deploy starts no
@@ -506,7 +544,10 @@ Use these commands instead of dropping below the CLI:
 
 ```bash
 anbo status --output json
+anbo impact --output json
+anbo test --affected --output jsonl
 anbo test notes-smoke --output jsonl
+anbo verify --full --output jsonl
 anbo logs --follow --service api --output jsonl
 anbo run --output jsonl -- node -e "console.log(process.env.ANBO_MINISTACK_ENDPOINT)"
 anbo cache inspect --output json
@@ -553,14 +594,18 @@ Reset MiniStack and private Terraform state, then deploy again:
 anbo reset --output jsonl
 ```
 
-Remove the project's local state and MiniStack volume:
+Remove the managed MiniStack runtime, its persistent volume, and private
+Terraform directory:
 
 ```bash
 anbo down --purge --output jsonl
 ```
 
-External clones are never deleted by Anbo. `--purge-clones` applies only to
-owned Anbo Cloud branches and must be requested explicitly.
+This intentionally retains supervisor and impact metadata under `.anbo/state`,
+build images and caches, and clone metadata. Use `anbo cache prune` to remove
+managed build images and local caches. External clones are never deleted by
+Anbo. `--purge-clones` applies only to owned Anbo Cloud branches and must be
+requested explicitly.
 
 ## 12. Definition of Done
 
@@ -571,9 +616,12 @@ Treat the sample as complete when all of these are true:
 - `deploy --no-test` provisions Terraform and reaches every service health
   check.
 - `anbo test` verifies a current-run user action and its important side effects.
-- `anbo sandbox up` repeats the full path with one command.
-- A second unchanged deploy reports build cache hits and skips unchanged
-  Terraform roots without starting workers.
+- `anbo sandbox up` repeats the affected path with one command.
+- With cacheable passing default tests and no mutable binding refresh, a second
+  unchanged deploy skips build, Terraform, service, and test phases without
+  starting unnecessary workers.
+- `anbo impact --output json` explains every execute or reuse decision.
+- `anbo verify --full` passes and records an attestation for the current graph.
 - `logs --follow` carries the active `ANBO_RUN_ID` through application logs.
 - An intentional failure produces a useful `debug` response with no secrets.
 - No test or benchmark invokes Terraform, Docker, or the smoke script outside
