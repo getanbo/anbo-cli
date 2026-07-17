@@ -438,6 +438,60 @@ test("Docker builds safely fall back when the Buildx plugin is unavailable", asy
   }
 });
 
+test("Docker builds retry without local cache export when the active Buildx driver rejects it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anbo-buildx-cache-fallback-"));
+  try {
+    await writeFile(join(directory, "Dockerfile"), "FROM scratch\n");
+    let built = false;
+    const output: string[] = [];
+    const executor = new TestExecutor(async (args) => {
+      if (args[0] === "image") return built
+        ? { code: 0, stdout: "sha256:fallback-image\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "missing" };
+      if (args[0] === "buildx" && args[1] === "version") {
+        return { code: 0, stdout: "github.com/docker/buildx v0.30.1\n", stderr: "" };
+      }
+      if (args[0] === "buildx" && args[1] === "build") {
+        if (args.includes("--cache-to")) {
+          return {
+            code: 1,
+            stdout: "",
+            stderr: "ERROR: Cache export is not supported for the docker driver.",
+          };
+        }
+        built = true;
+        return { code: 0, stdout: "built with engine cache\n", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected command: ${args.join(" ")}` };
+    });
+
+    const result = await buildDeclaredImages({
+      projectId: "cache-fallback",
+      root: directory,
+      builds: { api: { context: ".", inputs: ["Dockerfile"] } },
+      cacheRoot: join(directory, "cache"),
+    }, {
+      commands: executor,
+      onOutput: (_build, _stream, text) => {
+        output.push(text);
+      },
+    });
+
+    const builds = executor.calls.filter(
+      (call) => call.args[0] === "buildx" && call.args[1] === "build",
+    );
+    assert.equal(builds.length, 2);
+    assert.equal(builds[0]?.args.includes("--cache-to"), true);
+    assert.equal(builds[1]?.args.includes("--cache-to"), false);
+    assert.equal(builds[1]?.args.includes("--cache-from"), false);
+    assert.equal(result.api?.metadata["build_engine"], "buildx");
+    assert.equal(result.api?.metadata["build_cache"], "engine");
+    assert.match(output.join(""), /retrying with the engine layer cache/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Docker build fingerprints include executable mode changes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "anbo-build-mode-"));
   const cacheRoot = await mkdtemp(join(tmpdir(), "anbo-build-mode-cache-"));
