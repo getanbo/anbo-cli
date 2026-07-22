@@ -40,7 +40,7 @@
     }
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1088.0"
+    "@aws-sdk/client-dynamodb": "^3.1093.0"
   },
   "devDependencies": {
     "@getanbo/plugin-sdk": "0.2.0",
